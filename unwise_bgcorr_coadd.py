@@ -22,7 +22,7 @@ from crowdsource import wise_proc, crowdsource_base
 from crowdsource_base import sky_im
 
 import unwise_coadd
-from unwise_utils import phase_from_scanid, good_scan_mask
+from unwise_utils import phase_from_scanid, good_scan_mask, get_coadd_tile_wcs
 
 from astropy.io import fits
 from astropy.coordinates import SkyCoord 
@@ -31,7 +31,7 @@ from astropy.stats import sigma_clipped_stats, mad_std
 from astropy.convolution import convolve, Box2DKernel
 
 
-from astrometry.util.util import Tan, Sip
+from astrometry.util.util import Sip
 from astrometry.util.resample import resample_with_wcs, OverlapError
 
 from scipy.ndimage import binary_dilation, gaussian_filter1d, gaussian_filter, label
@@ -55,13 +55,7 @@ def _resolve_medfilt(medfilt, band_num):
     return medfilt if medfilt is not None else (50 if band_num in (3, 4) else 0)
 
 
-def _tile_wcs_from_header(hdr):
-    """Build a 2048x2048 tile's Tan WCS from header keywords (no temp-file round trip)."""
-    return Tan(float(hdr['CRVAL1']), float(hdr['CRVAL2']),
-               float(hdr['CRPIX1']), float(hdr['CRPIX2']),
-               float(hdr['CD1_1']), float(hdr['CD1_2']),
-               float(hdr['CD2_1']), float(hdr['CD2_2']),
-               2048.0, 2048.0)
+
  
  
 _TILE_W      = 2048
@@ -173,11 +167,42 @@ def _atlas_tile_coords(atlas_data):
     return _ATLAS_COORD_CACHE[key]
 
 
-def get_overlapping_coadds(exp_ra, exp_dec, atlas_data, margin_deg=1.7): 
+_ATLAS_RADEC_CACHE = {}
+
+
+def _atlas_radec_map(atlas_data):
+    """
+    Per-worker cache of {coadd_id: (ra, dec)} from the atlas table's precise
+    CRVAL column. Used to build each tile's WCS analytically via
+    unwise_utils.get_coadd_tile_wcs -- the same construction unwise_coadd.py
+    itself uses for every tile WCS, including the final coadd's own cowcs --
+    instead of trusting it to a model/mask FITS file's header, which could
+    in principle be stale or written with different precision.
+    """
+    key = id(atlas_data)
+    if key not in _ATLAS_RADEC_CACHE:
+        _ATLAS_RADEC_CACHE.clear()  # only one atlas per worker process lifetime
+        _ATLAS_RADEC_CACHE[key] = {
+            cid.strip(): (float(ra), float(dec))
+            for cid, (ra, dec) in zip(atlas_data['COADD_ID'], atlas_data['CRVAL'])
+        }
+    return _ATLAS_RADEC_CACHE[key]
+
+
+def get_overlapping_coadds(exp_ra, exp_dec, atlas_data, margin_deg=1.7, overlap_only=True):
     tile_coords = _atlas_tile_coords(atlas_data)
     exp_coord = SkyCoord(ra=exp_ra * u.deg, dec=exp_dec * u.deg)
     sep  = tile_coords.separation(exp_coord)
-    matched = atlas_data[sep <= margin_deg * u.deg] 
+    matched = atlas_data[sep <= margin_deg * u.deg]
+    if overlap_only and len(matched) > 0:
+        # Conservative geometric overlap test (same one used in
+        # find_valid_paths/get_exposures_for_tile): drops tiles within the
+        # radial margin that can't actually overlap this exposure, so
+        # project_coadd_onto_exposure/project_unwisemask_onto_exposure don't
+        # waste a resample_with_wcs call (and OverlapError) on them.
+        keep = exposure_overlaps_tile(exp_ra, exp_dec,
+                                      matched['CRVAL'][:, 0], matched['CRVAL'][:, 1])
+        matched = matched[keep]
     return [cid.strip() for cid in matched['COADD_ID']]
 
 
@@ -203,25 +228,29 @@ def load_exposure(exposure_path):
 
 
 @lru_cache(maxsize=12)
-def _load_model_tile(coadd_id, model_dir, band_num):
+def _load_model_tile(coadd_id, model_dir, band_num, ra, dec):
     """
-    Cache a tile's star model + WCS per worker process -- every exposure
-    overlapping a tile would otherwise re-read (and for masks, re-gunzip) the
-    same handful of files repeatedly.
+    Cache a tile's star model + canonical WCS per worker process -- every
+    exposure overlapping a tile would otherwise re-read (and for masks,
+    re-gunzip) the same handful of files repeatedly.
+
+    The WCS comes from get_coadd_tile_wcs(ra, dec) -- analytically, from the
+    atlas table -- not from the model file's header (see _atlas_radec_map).
     """
     model_path = os.path.join(model_dir, f"{coadd_id}.{band_num}.mod.fits")
     if not os.path.exists(model_path):
         return None
 
     # ext=1 is full model (stars + sky);  ext=2 is sky
-    ext_model, mod_hdr = fitsio.read(model_path, ext=1, header=True)
+    ext_model = fitsio.read(model_path, ext=1)
     ext_sky = fitsio.read(model_path, ext=2)
     stars_nanomag = ext_model.astype(np.float64) - ext_sky.astype(np.float64)
-    return stars_nanomag, _tile_wcs_from_header(mod_hdr)
+    return stars_nanomag, get_coadd_tile_wcs(ra, dec)
 
 
-def project_coadd_onto_exposure(coadd_id, model_dir, wcs_exp, shape_out, band_num):
-    cached = _load_model_tile(coadd_id, model_dir, band_num)
+def project_coadd_onto_exposure(coadd_id, model_dir, wcs_exp, shape_out, band_num, atlas_data):
+    ra, dec = _atlas_radec_map(atlas_data)[coadd_id]
+    cached = _load_model_tile(coadd_id, model_dir, band_num, ra, dec)
     if cached is None:
         print(f"  [project] model not found: {os.path.join(model_dir, coadd_id + '.' + str(band_num) + '.mod.fits')}")
         return None
@@ -251,7 +280,7 @@ def average_coadds_for_exposure(exposure_path, atlas_data, model_dir, band_num):
  
     for coadd_id in coadd_ids:
         stars_proj = project_coadd_onto_exposure(
-            coadd_id, model_dir, wcs_exp, shape_out, band_num
+            coadd_id, model_dir, wcs_exp, shape_out, band_num, atlas_data
         )
         if stars_proj is None:
             continue
@@ -270,7 +299,7 @@ def average_coadds_for_exposure(exposure_path, atlas_data, model_dir, band_num):
     return avg_stars_nanomag, data_exp, hdr_exp, weight, coadd_ids, wcs_exp #avg_sky_nanomag, 
 
 
-def construct_residual_exposure(exposure_path, atlas_data, model_dir, band_num):
+def construct_residual_exposure(exposure_path, atlas_data, model_dir, band_num, zp_lookup=None):
     
     avg_stars_nm, data_exp, hdr_exp, weight, coadd_ids, wcs_exp = average_coadds_for_exposure(
         exposure_path, atlas_data, model_dir, band_num
@@ -278,9 +307,16 @@ def construct_residual_exposure(exposure_path, atlas_data, model_dir, band_num):
 
     if avg_stars_nm is None:
         return data_exp, None, None, hdr_exp, weight, coadd_ids, wcs_exp
- 
-    magzp = float(hdr_exp['MAGZP'])
-    zpscale  = 10.0 ** ((22.5 - magzp) / 2.5)
+
+    # Zeropoint: prefer zp_lookup (a zp_lookup.ZPLookUp, matching how
+    # unwise_coadd.py itself derives zp during round 1 -- see its
+    # use_zp_meta / ZPLookUp.get_zp logic) over the raw MAGZP header card,
+    # so the stripe correction's photometric scaling matches the coadd's.
+    if zp_lookup is not None:
+        zp = zp_lookup.get_zp(hdr_exp['MJD_OBS'])
+    else:
+        zp = float(hdr_exp['MAGZP'])
+    zpscale  = 10.0 ** ((22.5 - zp) / 2.5)
     stars_dn = avg_stars_nm / zpscale
     residual = data_exp - stars_dn
  
@@ -299,8 +335,8 @@ _BIGOBJ_DILATION = 6
 
 
 @lru_cache(maxsize=12)
-def _load_unwise_mask_tile(coadd_id, release):
-    """Cache a tile's artifact mask groups + WCS per worker process (see _load_model_tile)."""
+def _load_unwise_mask_tile(coadd_id, release, ra, dec):
+    """Cache a tile's artifact mask groups + canonical WCS per worker process (see _load_model_tile)."""
     msk_path = (
         f"/global/cfs/cdirs/cosmo/work/wise/outputs/merge/{release}/fulldepth/"
         f"{coadd_id[:3]}/{coadd_id}/unwise-{coadd_id}-msk.fits.gz"
@@ -308,7 +344,7 @@ def _load_unwise_mask_tile(coadd_id, release):
     if not os.path.exists(msk_path):
         return None
 
-    msk_data, msk_hdr = fitsio.read(msk_path, header=True)
+    msk_data = fitsio.read(msk_path)
     msk_data = msk_data & ~np.int32(1 << 6)   # drop tile-boundary bit
 
     # Build the three group masks as clean booleans BEFORE reprojection,
@@ -316,11 +352,12 @@ def _load_unwise_mask_tile(coadd_id, release):
     psf_bool = ((msk_data & _PSF_BITS)   != 0).astype(np.float32)
     galaxy_bool = ((msk_data & _GALAXY_BIT) != 0).astype(np.float32)
     bigobj_bool = ((msk_data & _BIGOBJ_BIT) != 0).astype(np.float32)
-    return psf_bool, galaxy_bool, bigobj_bool, _tile_wcs_from_header(msk_hdr)
+    return psf_bool, galaxy_bool, bigobj_bool, get_coadd_tile_wcs(ra, dec)
 
 
-def project_unwisemask_onto_exposure(coadd_id, release, wcs_exp, shape_out):
-    cached = _load_unwise_mask_tile(coadd_id, release)
+def project_unwisemask_onto_exposure(coadd_id, release, wcs_exp, shape_out, atlas_data):
+    ra, dec = _atlas_radec_map(atlas_data)[coadd_id]
+    cached = _load_unwise_mask_tile(coadd_id, release, ra, dec)
     if cached is None:
         return None
     psf_bool, galaxy_bool, bigobj_bool, wcs_mod = cached
@@ -343,13 +380,13 @@ def project_unwisemask_onto_exposure(coadd_id, release, wcs_exp, shape_out):
     return psf_proj, galaxy_proj, bigobj_proj
 
 
-def get_unwisemask_for_exposure(coadd_ids, release, wcs_exp, shape_out):
+def get_unwisemask_for_exposure(coadd_ids, release, wcs_exp, shape_out, atlas_data):
     psf_combined = np.zeros(shape_out, dtype=bool)
     galaxy_combined = np.zeros(shape_out, dtype=bool)
     bigobj_combined = np.zeros(shape_out, dtype=bool)
 
     for coadd_id in coadd_ids:
-        result = project_unwisemask_onto_exposure(coadd_id, release, wcs_exp, shape_out)
+        result = project_unwisemask_onto_exposure(coadd_id, release, wcs_exp, shape_out, atlas_data)
         if result is None:
             continue
         psf_proj, galaxy_proj, bigobj_proj = result
@@ -521,9 +558,9 @@ def apply_lane_correction(work_res, flat_residual, band, unwise_mask=None, hp_si
     return output
 
 
-def correct_single_exposure(exposure_path, atlas_data, model_dir, band_num, release, star_dn_threshold=30.0, dilation_iters=4, unwise_dilation_iters=1):
+def correct_single_exposure(exposure_path, atlas_data, model_dir, band_num, release, star_dn_threshold=30.0, dilation_iters=4, unwise_dilation_iters=1, zp_lookup=None):
 
-    data_exp, stars_dn, residual, hdr_exp, weight, coadd_ids, wcs_exp = construct_residual_exposure(exposure_path, atlas_data, model_dir, band_num)
+    data_exp, stars_dn, residual, hdr_exp, weight, coadd_ids, wcs_exp = construct_residual_exposure(exposure_path, atlas_data, model_dir, band_num, zp_lookup=zp_lookup)
 
     if stars_dn is None:
         print(f"  SKIP (no projection): {os.path.basename(exposure_path)}")
@@ -555,7 +592,7 @@ def correct_single_exposure(exposure_path, atlas_data, model_dir, band_num, rele
     goodmask[~np.isfinite(data_exp)] = False
     
     # Build unWISE artifact mask in exposure frame from overlapping coadd tiles
-    unwise_flagged = get_unwisemask_for_exposure(coadd_ids, release, wcs_exp, data_exp.shape)
+    unwise_flagged = get_unwisemask_for_exposure(coadd_ids, release, wcs_exp, data_exp.shape, atlas_data)
 
     # star mask 
     star_locs   = (stars_dn > star_dn_threshold)
@@ -694,14 +731,26 @@ def _atomic_copy(src, dst):
     os.replace(tmp, dst)
 
 
-def init_worker(atlas, model_dir, band, base_outdir, release, force=False):
-    global _atlas_data, _MODEL_DIR, _BAND_NUM, BASE_OUTDIR, _RELEASE, _FORCE
+def init_worker(atlas, model_dir, band, base_outdir, release, force=False, use_zp_meta=False):
+    """
+    Set up a worker process for process_one_exposure.
+
+    use_zp_meta mirrors unwise_coadd.py's own --use_zp_meta flag: by
+    default (False) zeropoints come from zp_lookup.ZPLookUp(band, poly=True)
+    -- the same per-frame polynomial zeropoint unwise_coadd.py uses during
+    round 1 -- rather than from the exposure's raw MAGZP header card.
+    """
+    global _atlas_data, _MODEL_DIR, _BAND_NUM, BASE_OUTDIR, _RELEASE, _FORCE, _ZP_LOOKUP
     _atlas_data = atlas
     _MODEL_DIR  = model_dir
     _BAND_NUM   = band
     BASE_OUTDIR = base_outdir
     _RELEASE    = release
     _FORCE      = force
+    _ZP_LOOKUP  = None
+    if not use_zp_meta:
+        from zp_lookup import ZPLookUp
+        _ZP_LOOKUP = ZPLookUp(band, poly=True)
 
 
 def process_one_exposure(args):
@@ -733,6 +782,7 @@ def process_one_exposure(args):
             path_exp, _atlas_data, _MODEL_DIR, _BAND_NUM, _RELEASE,
             star_dn_threshold = 30.0,
             dilation_iters    = 4,
+            zp_lookup         = _ZP_LOOKUP,
         )
     except Exception as e:
         return idx, f"math_failed: {e}", None
@@ -948,12 +998,15 @@ def wise_frame_to_l1b_path(wise, band, int_gz=False):
 
 def correct_exposures_for_tile(WISE, band_num, model_dir, release, atlas_path,
                                 corr_outdir, coadd_id=None, nthreads=16,
-                                force=False, int_gz=False):
+                                force=False, int_gz=False, use_zp_meta=False):
     """
     Background/star/lane-correct the L1b exposures in `WISE` (already cut down
     to the frames unwise_coadd would use -- see filter_used_wise_frames),
     writing corrected int/unc/msk triplets into corr_outdir using the same
     directory layout as unwise_utils.get_l1b_file.
+
+    use_zp_meta: see init_worker -- default False uses zp_lookup.ZPLookUp,
+    matching unwise_coadd.py's own default zeropoint source.
 
     Returns (results, missing): results is one dict per exposure found on disk,
     and missing is the {(scan_id, frame_num)} set of WISE rows with no L1b
@@ -973,7 +1026,7 @@ def correct_exposures_for_tile(WISE, band_num, model_dir, release, atlas_path,
 
     results = [None] * len(valid_paths)
     with Pool(processes=nthreads, initializer=init_worker,
-              initargs=(atlas_data, model_dir, band_num, corr_outdir, release, force)) as pool:
+              initargs=(atlas_data, model_dir, band_num, corr_outdir, release, force, use_zp_meta)) as pool:
         for idx, status, stats in pool.imap_unordered(process_one_exposure, list(enumerate(valid_paths))):
             results[idx] = {'path': valid_paths[idx], 'status': status, **(stats or {})}
 
@@ -1004,7 +1057,7 @@ def _wrap_get_l1b_file(orig_get_l1b_file, corr_outdir, bad=frozenset(), fallback
         return orig_get_l1b_file(basedir, scanid, frame, band, int_gz=int_gz)
     return wrapped
 
-def _init_unwise_coadd_globals(int_gz=False):
+def _init_unwise_coadd_globals(int_gz=False, use_zp_meta=False):
     """Set unwise_coadd's module globals, as its own main() does. Must run
     BEFORE any multiproc pool is created, because workers are forked with a
     copy of these globals."""
@@ -1012,8 +1065,11 @@ def _init_unwise_coadd_globals(int_gz=False):
         logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
         unwise_coadd.logger = logging.getLogger('unwise_coadd')
     unwise_coadd.int_gz = int_gz
-    if unwise_coadd.use_zp_meta is None:
-        unwise_coadd.use_zp_meta = False
+    # Same flag/default as unwise_coadd.py's own --use_zp_meta: False uses
+    # zp_lookup.ZPLookUp; True uses the raw MAGZP header card. The L1b
+    # stripe correction uses this same setting (see correct_exposures_for_tile),
+    # so the correction's photometric scaling matches the coadd's own.
+    unwise_coadd.use_zp_meta = use_zp_meta
     if unwise_coadd.compare_moon_all is None:
         unwise_coadd.compare_moon_all = False
         
@@ -1021,21 +1077,41 @@ def _init_unwise_coadd_globals(int_gz=False):
 def run_corrected_coadd(coadd_id, band_num, model_dir, release, atlas_path,
                          corr_outdir, final_outdir, W=2048, H=2048, pixscale=2.75,
                          nthreads=16, force_bg=False, force=False, int_gz=False,
-                         make_plots=True, one_coadd_kwargs=None):
+                         make_plots=True, one_coadd_kwargs=None,
+                         save_corrected_images=False, use_zp_meta=False):
     """
     End-to-end: select the L1b exposures unwise_coadd would use for one coadd
     tile, background-correct only those, then build the final coadd from the
     corrected frames by calling unwise_coadd.one_coadd(). unwise_coadd.py is
     not modified.
+
+    corr_outdir: where corrected int/unc/msk triplets are written. If None,
+        a private temporary directory is created and used instead (and
+        always cleaned up afterwards, regardless of save_corrected_images,
+        since the caller never named a path it could reuse).
+    save_corrected_images: if True, leave the corrected L1b files in
+        corr_outdir after the run (useful to reuse/cache them across
+        overlapping tiles, or for inspection/debugging). If False, the
+        corrected files are deleted once the coadd has been built -- but
+        only when corr_outdir was auto-created here; an explicitly-passed
+        corr_outdir is never auto-deleted, since it may be a shared cache
+        directory used by other runs/tiles.
+    use_zp_meta: same flag/semantics as unwise_coadd.py's own --use_zp_meta.
+        Default False: both the stripe correction and the final coadd get
+        their per-frame zeropoint from zp_lookup.ZPLookUp(band, poly=True).
+        True: both use the raw MAGZP header card instead.
     """
     tile = unwise_coadd.get_atlas_tiles(0., 360., -90., 90., coadd_id=coadd_id)
     assert len(tile) == 1
     tile = tile[0]
 
-    _init_unwise_coadd_globals(int_gz)
+    _init_unwise_coadd_globals(int_gz, use_zp_meta)
 
     # Absolute paths, so the chdir below doesn't break any output location
     global _DL_ROOT
+    owns_corr_outdir = corr_outdir is None
+    if owns_corr_outdir:
+        corr_outdir = tempfile.mkdtemp(prefix='unwise_bgcorr_')
     corr_outdir  = os.path.abspath(corr_outdir)
     final_outdir = os.path.abspath(final_outdir)
     _DL_ROOT     = corr_outdir          # downloads go to corr_outdir/merge_p1bm_frm
@@ -1049,7 +1125,8 @@ def run_corrected_coadd(coadd_id, band_num, model_dir, release, atlas_path,
 
     results, missing = correct_exposures_for_tile(
         WISE_corr, band_num, model_dir, release, atlas_path, corr_outdir,
-        coadd_id=coadd_id, nthreads=nthreads, force=force_bg, int_gz=int_gz)
+        coadd_id=coadd_id, nthreads=nthreads, force=force_bg, int_gz=int_gz,
+        use_zp_meta=use_zp_meta)
 
     if make_plots and results:
         plot_run_diagnostics(results, coadd_id, 'w%i' % band_num, final_outdir)
@@ -1091,8 +1168,9 @@ def run_corrected_coadd(coadd_id, band_num, model_dir, release, atlas_path,
     finally:
         os.chdir(cwd)
         unwise_coadd.get_l1b_file = orig_get_l1b_file
+        if owns_corr_outdir and not save_corrected_images:
+            shutil.rmtree(corr_outdir, ignore_errors=True)
 
-    
     if fallback_log:
         print(f'  [bg-corr] WARNING: {len(fallback_log)} frame(s) fell back to raw '
               f'L1b data (not background-corrected): {fallback_log}')
@@ -1109,7 +1187,17 @@ def main():
     parser.add_argument('--model-dir', required=True, help='crowdsource star model directory (*.mod.fits)')
     parser.add_argument('--release', required=True, help='unwise release tag used to find -msk.fits.gz artifact masks')
     parser.add_argument('--atlas', required=True, help='atlas FITS table with CRVAL and COADD_ID columns')
-    parser.add_argument('--corr-outdir', required=True, help='directory to write background-corrected L1b files')
+    parser.add_argument('--corr-outdir', default=None,
+                      help=('directory to write background-corrected L1b files. '
+                            'Default: a private temporary directory, which is deleted '
+                            'after the coadd is built unless --save-corrected-images is given.'))
+    parser.add_argument('--save-corrected-images', dest='save_corrected_images', action='store_true',
+                      default=False,
+                      help=('keep the background-corrected L1b files in --corr-outdir after the run '
+                            '(e.g. to reuse/cache them across overlapping tiles, or for inspection). '
+                            'Default: delete them once the coadd has been built. Has no effect -- the '
+                            'files are never auto-deleted -- if --corr-outdir was explicitly given, '
+                            'since that directory may be a shared cache used by other runs.'))
     parser.add_argument('--outdir', required=True, help='final coadd output directory')
     parser.add_argument('--nthreads', type=int, default=16)
     parser.add_argument('--force-bg', action='store_true', help='re-run correction even if cached output exists')
@@ -1171,12 +1259,19 @@ def main():
                       help='Multithreading during round 1')
     parser.add_argument('--force', dest='force', action='store_true',
                       default=False, help='Run even if output file already exists?')
+    parser.add_argument('--use_zp_meta', dest='use_zp_meta', action='store_true', default=False,
+                      help=('Should coadd use MAGZP metadata for zero points? (same flag as '
+                            'unwise_coadd.py; also controls the zeropoint used by the stripe '
+                            'correction itself, so both stay consistent). Default: use '
+                            'zp_lookup.ZPLookUp.'))
     args = parser.parse_args()
 
     # unwise_coadd.py's own resolution of --medfilt: None -> 50 for W3,W4 else 0.
     medfilt = _resolve_medfilt(args.medfilt, args.band)
 
-    _init_unwise_coadd_globals() 
+    # Must happen before mp1/mp2 pools below are created (forked workers get
+    # a copy of unwise_coadd's globals at that point).
+    _init_unwise_coadd_globals(use_zp_meta=args.use_zp_meta)
 
     # mirrors unwise_coadd.py main()'s own --threads/--threads1 -> mp1/mp2 logic
     from astrometry.util.multiproc import multiproc
@@ -1199,6 +1294,8 @@ def main():
         args.corr_outdir, args.outdir, nthreads=args.nthreads,
         force_bg=args.force_bg, force=args.force,
         make_plots=not args.no_plots, one_coadd_kwargs=one_coadd_kwargs,
+        save_corrected_images=args.save_corrected_images,
+        use_zp_meta=args.use_zp_meta,
     )
     return rtn
 
