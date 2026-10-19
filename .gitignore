@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# Build products of the optional patch_image C accelerator
+# (python setup_patch.py build_ext --inplace)
+build/
+*.so

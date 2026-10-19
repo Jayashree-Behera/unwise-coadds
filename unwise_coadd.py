@@ -18,12 +18,17 @@ import random
 from warp_utils import WarpMetaParameters, mask_extreme_pix, compute_warp, apply_warp, gen_warp_table, update_included_bitmask, parse_write_quadrant_masks, RecoveryStats, pad_rebin_weighted, ReferenceImage, QuadrantWarp, reference_image_from_dir
 from unwise_utils import tile_to_radec, int_from_scan_frame, zeropointToScale, retrieve_git_version, get_dir_for_coadd, get_epoch_breaks, get_coadd_tile_wcs, get_l1b_file, download_frameset_1band, clear_partial_l1b_triplet, sanity_check_inputs, phase_from_scanid, header_reference_keywords, get_l1b_dirs, is_nearby, good_scan_mask, ascending
 from hi_lo import HiLo
+from pipeline_timing import stage as timing_stage, tick as timing_tick, \
+    report_now as timing_report_now
 
 import fitsio
 
 from astrometry.util.file import trymakedirs
 from astrometry.util.fits import fits_table, merge_tables
-from astrometry.util.miscutils import estimate_mode, polygons_intersect, clip_polygon, patch_image
+from astrometry.util.miscutils import estimate_mode, polygons_intersect, clip_polygon
+# Bit-identical, ~2.5x faster replacement for
+# astrometry.util.miscutils.patch_image; see fast_patch.py.
+from fast_patch import patch_image
 from astrometry.util.util import Tan, Sip, flat_median_f
 from astrometry.util.resample import resample_with_wcs, OverlapError
 from astrometry.util.run_command import run_command
@@ -67,6 +72,11 @@ destripe_save_dir = None # should get assigned in main
 destripe_use_cache = False # should get assigned in main
 # --force-bg: rewrite saved corrected frames even if they already exist?
 destripe_force = False # should get assigned in main
+# --no_output_masks: when False, the per-exposure outlier masks are never
+# written, so _coadd_one_round2 can skip building mm.omask (and the
+# resample_with_wcs call that fills it) entirely. Set in main, before the
+# multiprocessing pools are created.
+want_output_masks = True # should get assigned in main
 
 class FirstRoundCoadd():
     def __init__(self, coimg1, cow1, coppstd1, cowimgsq1, con1):
@@ -1688,75 +1698,90 @@ def _coadd_one_round2(X):
     cox0,cox1,coy0,coy1 = rr.coextent
     coslc = slice(coy0, coy1+1), slice(cox0, cox1+1)
     # Remove this image from the per-pixel std calculation...
-    if included_round1:
-        subw  = np.maximum(cow1[coslc] - rr.w, tinyw)
-        subco = (cowimg1  [coslc] - (rr.w * rr.rimg   )) / subw
-        subsq = (cowimgsq1[coslc] - (rr.w * rr.rimg**2)) / subw
-    else:
-        subw  = np.maximum(cow1[coslc], tinyw)
-        subco = (cowimg1[coslc]) / subw
-        subsq = (cowimgsq1[coslc]) / subw
-    
-    subv = np.maximum(0, subsq - subco**2)
+    with timing_stage('round2_sub'):
+        if included_round1:
+            subw  = np.maximum(cow1[coslc] - rr.w, tinyw)
+            subco = (cowimg1  [coslc] - (rr.w * rr.rimg   )) / subw
+            subsq = (cowimgsq1[coslc] - (rr.w * rr.rimg**2)) / subw
+        else:
+            subw  = np.maximum(cow1[coslc], tinyw)
+            subco = (cowimg1[coslc]) / subw
+            subsq = (cowimgsq1[coslc]) / subw
 
-    # previously, no prior:
-    # subp = np.sqrt(np.maximum(0, subsq - subco**2))
+        subv = np.maximum(0, subsq - subco**2)
 
-    # "prior" estimate of per-pixel noise: sig1 + 3% flux in quadrature
-    # rr.w = 1./sig1**2 for this image.
-    priorv = 1./rr.w + (0.03 * np.maximum(subco, 0))**2
-    # Weight that prior equal to the 'subv' estimate from nprior exposures
-    nprior = 5
-    priorw = nprior * rr.w
-    subpp = np.sqrt((subv * subw + priorv * priorw) / (subw + priorw))
-    
-    # rr.rmask bit value 1 indicates that the pixel is within the coadd
-    # region.
-    mask = (rr.rmask & 1).astype(bool)
+        # previously, no prior:
+        # subp = np.sqrt(np.maximum(0, subsq - subco**2))
+
+        # "prior" estimate of per-pixel noise: sig1 + 3% flux in quadrature
+        # rr.w = 1./sig1**2 for this image.
+        priorv = 1./rr.w + (0.03 * np.maximum(subco, 0))**2
+        # Weight that prior equal to the 'subv' estimate from nprior exposures
+        nprior = 5
+        priorw = nprior * rr.w
+        subpp = np.sqrt((subv * subw + priorv * priorw) / (subw + priorw))
+
+        # rr.rmask bit value 1 indicates that the pixel is within the coadd
+        # region.
+        mask = (rr.rmask & 1).astype(bool)
 
     # like in the WISE Atlas Images, estimate sky difference via
     # median difference in the overlapping area.
     if do_dsky:
-        dsky = median_f((rr.rimg[mask] - subco[mask]).astype(np.float32))
+        with timing_stage('round2_dsky'):
+            dsky = median_f((rr.rimg[mask] - subco[mask]).astype(np.float32))
         debug('Sky difference:', dsky)
     else:
         dsky = 0.
 
-    rchi = ((rr.rimg - dsky - subco) * mask * (subw > 0) * (subpp > 0) /
-            np.maximum(subpp, 1e-6))
-    if not (np.all(np.isfinite(rchi))):
-        print('something very unusual is going on')
-        return None
+    with timing_stage('round2_rchi'):
+        # Combine the three 0/1 factors as booleans first. Multiplying a float
+        # array by 1.0 is exact and by 0.0 gives the same result as the product
+        # of the separate factors, so this is the same value as
+        # ... * mask * (subw > 0) * (subpp > 0), with two fewer full-size float
+        # multiplies and temporaries.
+        keep = mask & (subw > 0) & (subpp > 0)
+        rchi = ((rr.rimg - dsky - subco) * keep /
+                np.maximum(subpp, 1e-6))
+        if not (np.all(np.isfinite(rchi))):
+            print('something very unusual is going on')
+            return None
 
-    assert(np.all(np.isfinite(rchi)))
+        badpix = ((np.abs(rchi) >= 5.) & (con1[coslc] > 2))
+        #print 'Number of rchi-bad pixels:', np.count_nonzero(badpix)
 
-    badpix = ((np.abs(rchi) >= 5.) & (con1[coslc] > 2))
-    #print 'Number of rchi-bad pixels:', np.count_nonzero(badpix)
+        mm.nrchipix = np.count_nonzero(badpix)
 
-    mm.nrchipix = np.count_nonzero(badpix)
-
-    # Bit 1: abs(rchi) >= 5
-    badpixmask = badpix.astype(np.uint8)
-    # grow by a small margin
-    badpix = binary_dilation(badpixmask)
-    # Bit 2: grown
-    badpixmask = (badpixmask + (2 * badpix))
-    # Add rchi-masked pixels to the mask
-    # (clear bit 2)
-    rr.rmask[badpix] = (rr.rmask[badpix] & ~np.uint8(2))
-    mm.omask = np.zeros((int(rr.wcs.get_height()), int(rr.wcs.get_width())),
-                        badpixmask.dtype)
-    try:
-        Yo,Xo,Yi,Xi,nil = resample_with_wcs(rr.wcs, rr.cosubwcs, [], None)
-        mm.omask[Yo,Xo] = badpixmask[Yi,Xi]
-    except OverlapError:
-        import traceback
-        debug('WARNING: Caught OverlapError resampling rchi mask')
-        debug('rr WCS', rr.wcs)
-        debug('shape', mm.omask.shape)
-        debug('cosubwcs:', rr.cosubwcs)
-        if logger.isEnabledFor(logging.DEBUG):
-            traceback.print_exc(None, sys.stdout)
+        # Bit 1: abs(rchi) >= 5
+        badpixmask = badpix.astype(np.uint8)
+        # grow by a small margin
+        badpix = binary_dilation(badpixmask)
+        # Bit 2: grown
+        badpixmask = (badpixmask + (2 * badpix))
+        # Add rchi-masked pixels to the mask
+        # (clear bit 2)
+        rr.rmask[badpix] = (rr.rmask[badpix] & ~np.uint8(2))
+    # mm.omask is only read back by parse_write_masks /
+    # parse_write_quadrant_masks when masks are actually written, and by the
+    # per-exposure diagnostic plot. Under --no_output_masks with no plot it is
+    # dead, and building it costs a full resample_with_wcs per exposure --
+    # the single most expensive step in round 2, which runs serially unless
+    # --threads was given.
+    if want_output_masks or plotfn:
+        with timing_stage('round2_omask'):
+            mm.omask = np.zeros((int(rr.wcs.get_height()), int(rr.wcs.get_width())),
+                                badpixmask.dtype)
+            try:
+                Yo,Xo,Yi,Xi,nil = resample_with_wcs(rr.wcs, rr.cosubwcs, [], None)
+                mm.omask[Yo,Xo] = badpixmask[Yi,Xi]
+            except OverlapError:
+                import traceback
+                debug('WARNING: Caught OverlapError resampling rchi mask')
+                debug('rr WCS', rr.wcs)
+                debug('shape', mm.omask.shape)
+                debug('cosubwcs:', rr.cosubwcs)
+                if logger.isEnabledFor(logging.DEBUG):
+                    traceback.print_exc(None, sys.stdout)
 
     if mm.nrchipix > mm.ncopix * rchi_fraction:
         print('WARNING: dropping exposure %s: n rchi pixels %i / %i' %
@@ -1772,21 +1797,23 @@ def _coadd_one_round2(X):
             mm.rmask_orig = rr.rmask.copy()
 
     if mm.included:
-        ok = patch_image(rr.rimg, np.logical_not(badpix),
-                         required=(badpix * mask))
+        with timing_stage('round2_patch'):
+            ok = patch_image(rr.rimg, np.logical_not(badpix),
+                             required=(badpix * mask))
         if not ok:
             print('patch_image failed')
             return None
 
-        rimg = (rr.rimg - dsky)
-        mm.coslc = coslc
-        mm.coimgsq = mask * rr.w * rimg**2
-        mm.coimg   = mask * rr.w * rimg
-        mm.cow     = mask * rr.w
-        mm.con     = mask
-        # mm.rmask2 is bit value 2 from rr.rmask: original L1b pixel good
-        # times dilated rchi-based pixel good.
-        mm.rmask2  = (rr.rmask & 2).astype(bool)
+        with timing_stage('round2_out'):
+            rimg = (rr.rimg - dsky)
+            mm.coslc = coslc
+            mm.coimgsq = mask * rr.w * rimg**2
+            mm.coimg   = mask * rr.w * rimg
+            mm.cow     = mask * rr.w
+            mm.con     = mask
+            # mm.rmask2 is bit value 2 from rr.rmask: original L1b pixel good
+            # times dilated rchi-based pixel good.
+            mm.rmask2  = (rr.rmask & 2).astype(bool)
 
     mm.dsky = dsky / rr.zpscale
         
@@ -1895,6 +1922,7 @@ def _coadd_one_round2(X):
         plt.savefig(plotfn)
 
     debug(Time() - t00)
+    timing_tick('round2')
     return mm
 
 class coaddacc():
@@ -2113,9 +2141,10 @@ def coadd_wise(tile, cowcs, WISE, ps, band, mp1, mp2,
     rstats = None # dummy return value which may or may not get updated
 
     # Round-1 coadd:
-    (rimgs, r1_coadd, rstats, cube1) = _coadd_wise_round1(
-        cowcs, WISE, ps, band, table, L, tinyw, mp1, medfilt, checkmd5,
-        bgmatch, do_cube1, reference=reference, recover=recover, hi_lo_rej=hi_lo_rej)
+    with timing_stage('PHASE_round1'):
+        (rimgs, r1_coadd, rstats, cube1) = _coadd_wise_round1(
+            cowcs, WISE, ps, band, table, L, tinyw, mp1, medfilt, checkmd5,
+            bgmatch, do_cube1, reference=reference, recover=recover, hi_lo_rej=hi_lo_rej)
 
     if not warp_all:
         assert(len(rimgs) == len(WISE))
@@ -2402,7 +2431,8 @@ def coadd_wise(tile, cowcs, WISE, ps, band, mp1, mp2,
             mm = _coadd_one_round2(
                 (ri, num_round1_images, scanid, rr, r1_coadd.cow1, r1_coadd.cowimg1, r1_coadd.cowimgsq1, tinyw,
                  plotfn, ps1, do_dsky, rchi_fraction, r1_coadd.con1))
-            coadd.acc(mm, delmm=delmm)
+            with timing_stage('round2_acc'):
+                coadd.acc(mm, delmm=delmm)
             if mm is not None:
                 mm.scan_id = this_scan_id
                 mm.frame_num = this_frame_num
@@ -2438,11 +2468,13 @@ def coadd_wise(tile, cowcs, WISE, ps, band, mp1, mp2,
             masks.append(mm)
             if mm is None:
                 continue
-            coadd.acc(mm, delmm=delmm)
+            with timing_stage('round2_acc'):
+                coadd.acc(mm, delmm=delmm)
             if i == inext:
                 inext *= 2
                 info('Accumulated', i, 'of', Nimgs, ':', Time()-t0)
 
+    timing_report_now('round2')
     t0 = Time()
     debug('Before garbage collection:', Time()-t0)
     gc.collect()
@@ -2450,17 +2482,19 @@ def coadd_wise(tile, cowcs, WISE, ps, band, mp1, mp2,
 
     # this should be only for the case of full-depth warp recovery
     if (recover is not None) and (reference is None):
-        # recover contains Moon-contaminated subset of rows from exposure metadata table
-        coadd_copy = deepcopy(coadd)
-        coimg,  coinvvar,  coppstd,  con, coimgb, coinvvarb, coppstdb, conb, cube = extract_round2_outputs(coadd_copy, tinyw)
-        reference = ReferenceImage(coimg, coppstd, con)
-        # does cowcs need to be **full** coadd WCS here ?? think so..
-        zp_lookup_obj = ZPLookUp(band, poly=True)
-        coadd, warp_list, qmasks, rstats = recover_warped_frames(recover, coadd, reference, cowcs, zp_lookup_obj, r1_coadd, do_rebin=do_rebin)
+        with timing_stage('PHASE_recover_warped'):
+            # recover contains Moon-contaminated subset of rows from exposure metadata table
+            coadd_copy = deepcopy(coadd)
+            coimg,  coinvvar,  coppstd,  con, coimgb, coinvvarb, coppstdb, conb, cube = extract_round2_outputs(coadd_copy, tinyw)
+            reference = ReferenceImage(coimg, coppstd, con)
+            # does cowcs need to be **full** coadd WCS here ?? think so..
+            zp_lookup_obj = ZPLookUp(band, poly=True)
+            coadd, warp_list, qmasks, rstats = recover_warped_frames(recover, coadd, reference, cowcs, zp_lookup_obj, r1_coadd, do_rebin=do_rebin)
     else:
         qmasks = None # dummy return value
 
-    coimg,  coinvvar,  coppstd,  con, coimgb, coinvvarb, coppstdb, conb, cube = extract_round2_outputs(coadd, tinyw)
+    with timing_stage('PHASE_extract'):
+        coimg,  coinvvar,  coppstd,  con, coimgb, coinvvarb, coppstdb, conb, cube = extract_round2_outputs(coadd, tinyw)
 
     # think it's best to only do coadd-level sky subtraction
     # *after* attempting to recover Moon-contaminated frames
@@ -2616,9 +2650,10 @@ def _coadd_one_round1(X, store_xy_coords=False):
     coH = int(1 + coy1 - coy0)
 
     # We read the full images for sky-estimation purposes -- really necessary?
-    fullimg,ihdr = fitsio.read(intfn, header=True)
-    fullmask = fitsio.read(maskfn)
-    fullunc  = fitsio.read(uncfn )
+    with timing_stage('round1_read'):
+        fullimg,ihdr = fitsio.read(intfn, header=True)
+        fullmask = fitsio.read(maskfn)
+        fullunc  = fitsio.read(uncfn )
     img  = fullimg [slc]
     mask = fullmask[slc]
     unc  = fullunc [slc]
@@ -2655,16 +2690,18 @@ def _coadd_one_round1(X, store_xy_coords=False):
 
     destripe_stats = None
     if destripe_ctx is not None:
-        fullimg, destripe_stats = _destripe_frame(fullimg, fullmask, fullunc, maskbits,
-                                                  wcs_full, zp, ihdr, intfn)
+        with timing_stage('round1_destripe'):
+            fullimg, destripe_stats = _destripe_frame(fullimg, fullmask, fullunc, maskbits,
+                                                      wcs_full, zp, ihdr, intfn)
         img = fullimg[slc]
 
-    goodmask = ((mask & maskbits) == 0)
-    goodmask[unc == 0] = False
-    goodmask[np.logical_not(np.isfinite(img))] = False
-    goodmask[np.logical_not(np.isfinite(unc))] = False
+    with timing_stage('round1_goodmask'):
+        goodmask = ((mask & maskbits) == 0)
+        goodmask[unc == 0] = False
+        goodmask[np.logical_not(np.isfinite(img))] = False
+        goodmask[np.logical_not(np.isfinite(unc))] = False
 
-    sig1 = median_f(unc[goodmask])
+        sig1 = median_f(unc[goodmask])
     debug('sig1:', sig1)
     del mask
     del unc
@@ -2677,7 +2714,8 @@ def _coadd_one_round1(X, store_xy_coords=False):
     if rr.npatched > 200000:
         print('WARNING: too many pixels to patch:', rr.npatched)
         return None
-    ok = patch_image(img, goodmask.copy())
+    with timing_stage('round1_patch'):
+        ok = patch_image(img, goodmask.copy())
     if not ok:
         print('WARNING: Patching failed:')
         print('Image size:', img.shape)
@@ -2686,10 +2724,11 @@ def _coadd_one_round1(X, store_xy_coords=False):
     assert(np.all(np.isfinite(img)))
 
     # Estimate sky level
-    fullok = ((fullmask & maskbits) == 0)
-    fullok[fullunc == 0] = False
-    fullok[np.logical_not(np.isfinite(fullimg))] = False
-    fullok[np.logical_not(np.isfinite(fullunc))] = False
+    with timing_stage('round1_fullok'):
+        fullok = ((fullmask & maskbits) == 0)
+        fullok[fullunc == 0] = False
+        fullok[np.logical_not(np.isfinite(fullimg))] = False
+        fullok[np.logical_not(np.isfinite(fullunc))] = False
 
     if medfilt:
         from astrometry.util.util import median_smooth
@@ -2748,10 +2787,11 @@ def _coadd_one_round1(X, store_xy_coords=False):
         
     # add some noise to smooth out "dynacal" artifacts
     # NOTE -- this is just for the background estimation!
-    fim = fullimg[fullok]
-    scan_frame_int = int_from_scan_frame(wise.scan_id, wise.frame_num)
-    np.random.seed(scan_frame_int)
-    fim += np.random.normal(scale=sig1, size=fim.shape) 
+    with timing_stage('round1_noise'):
+        fim = fullimg[fullok]
+        scan_frame_int = int_from_scan_frame(wise.scan_id, wise.frame_num)
+        np.random.seed(scan_frame_int)
+        fim += np.random.normal(scale=sig1, size=fim.shape) 
     if ps:
         vals,counts,fitcounts,sky,warn,be1,bc1 = estimate_mode(fim, return_fit=True)
         rr.hist = np.histogram(fullimg[fullok], range=(vals[0],vals[-1]), bins=100)
@@ -2792,11 +2832,16 @@ def _coadd_one_round1(X, store_xy_coords=False):
             
 
     else:
-        sky = estimate_mode(fim)
+        with timing_stage('round1_skyest'):
+            sky = estimate_mode(fim)
 
     debug('Estimated sky:', sky)
-    debug('Image median:', np.median(fullimg[fullok]))
-    debug('Image median w/ noise:', np.median(fim))
+    # Python evaluates call arguments before debug() can discard them, so
+    # these two medians over the full frame were computed on every frame even
+    # with debug logging off.
+    if logger.isEnabledFor(logging.DEBUG):
+        debug('Image median:', np.median(fullimg[fullok]))
+        debug('Image median w/ noise:', np.median(fim))
 
     del fim
     del fullunc
@@ -2812,8 +2857,9 @@ def _coadd_one_round1(X, store_xy_coords=False):
     # coadd subimage
     cosubwcs = cowcs.get_subimage(int(cox0), int(coy0), coW, coH)
     try:
-        Yo,Xo,Yi,Xi,rims = resample_with_wcs(cosubwcs, wcs, [img], L,
-                                             table=table)
+        with timing_stage('round1_resample'):
+            Yo,Xo,Yi,Xi,rims = resample_with_wcs(cosubwcs, wcs, [img], L,
+                                                 table=table)
     except OverlapError:
         debug('No overlap; skipping')
         return None
@@ -2853,6 +2899,7 @@ def _coadd_one_round1(X, store_xy_coords=False):
         rr.y_coadd = Yo
 
     debug(Time() - t00)
+    timing_tick('round1')
     return rr
 
 def _coadd_wise_round1(cowcs, WISE, ps, band, table, L, tinyw, mp, medfilt,
@@ -2909,9 +2956,10 @@ def _coadd_wise_round1(cowcs, WISE, ps, band, table, L, tinyw, mp, medfilt,
 
         _t0 = _time()
         print('constructing min and max coadd images based on first round L1b images')
-        for iii, rrr in enumerate(rimgs):
-            if rrr is not None:
-                hilo.update(rrr)
+        with timing_stage('round1_hilo'):
+            for iii, rrr in enumerate(rimgs):
+                if rrr is not None:
+                    hilo.update(rrr)
         print((_time() - _t0), ' ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
 
     cube = None
@@ -2945,10 +2993,18 @@ def _coadd_wise_round1(cowcs, WISE, ps, band, table, L, tinyw, mp, medfilt,
         else:
             good = 1.0
 
-        coimgsq[slc] += rr.w * good * (rr.rimg**2)
-        coimg  [slc] += rr.w * good *  rr.rimg
-        cow    [slc] += rr.w * good * (rr.rmask & 1)
-        con1   [slc] += good * (rr.rmask & 1)
+        # rr.w * good and rr.rmask & 1 were each rebuilt up to four times per
+        # frame. Python evaluates `rr.w * good * X` left to right, so hoisting
+        # (rr.w * good) keeps exactly the same operand grouping and therefore
+        # the same floating-point result.
+        wgood = rr.w * good
+        rinbounds = rr.rmask & 1
+
+        with timing_stage('round1_accum'):
+            coimgsq[slc] += wgood * (rr.rimg**2)
+            coimg  [slc] += wgood *  rr.rimg
+            cow    [slc] += wgood * rinbounds
+            con1   [slc] += good  * rinbounds
 
         if cube1:
             cube[(z,)+slc] = rr.rimg.astype(np.float32)
@@ -3266,6 +3322,10 @@ def main():
     compare_moon_all = opt.compare_moon_all
 
     # (this needs to happen before the multiprocessing pools are created)
+    global want_output_masks
+    want_output_masks = opt.output_masks
+
+    # (this needs to happen before the multiprocessing pools are created)
     global destripe_ctx
     global destripe_save_dir
     global destripe_use_cache
@@ -3452,6 +3512,7 @@ def main():
                  warp_all=opt.warp_all, reference_dir=opt.reference_dir, hi_lo_rej=opt.hi_lo_rej,
                  output_masks=opt.output_masks):
         return -1
+    timing_report_now('tile')
     print('Tile', tile.coadd_id, 'band', opt.band, 'took:', Time()-t0)
     return 0
 

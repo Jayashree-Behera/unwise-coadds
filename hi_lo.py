@@ -21,25 +21,19 @@ class HiLo():
 
         slc = slice(y0_coadd, y1_coadd), slice(x0_coadd, x1_coadd)
 
+        # Basic slicing returns views, so writing through sub_* already
+        # updates self.*; the assignments back into self.*[slc] that used to
+        # follow were copies of each sub-array onto itself. Boolean masks also
+        # avoid materialising the two index arrays np.where built only to feed
+        # straight back into fancy indexing.
         sub_im_min = self.im_min[slc]
         sub_im_max = self.im_max[slc]
 
-        sub_id_min = self.id_min[slc]
-        sub_id_max = self.id_max[slc]
+        is_min = rimg.rimg < sub_im_min
+        is_max = rimg.rimg > sub_im_max
 
-        iy_min, ix_min = np.where((rimg.rimg < sub_im_min))
-        iy_max, ix_max = np.where((rimg.rimg > sub_im_max))
+        sub_im_min[is_min] = rimg.rimg[is_min]
+        sub_im_max[is_max] = rimg.rimg[is_max]
 
-        # if statements !! if len(iy_min) > 0 ... etc.
-
-        sub_im_min[iy_min, ix_min] = (rimg.rimg)[iy_min, ix_min]
-        sub_im_max[iy_max, ix_max] = (rimg.rimg)[iy_max, ix_max]
-
-        self.im_min[slc] = sub_im_min
-        self.im_max[slc] = sub_im_max
-
-        sub_id_min[iy_min, ix_min] = id
-        sub_id_max[iy_max, ix_max] = id
-
-        self.id_min[slc] = sub_id_min
-        self.id_max[slc] = sub_id_max
+        self.id_min[slc][is_min] = id
+        self.id_max[slc][is_max] = id

@@ -1,5 +1,7 @@
 import numpy as np
-from astrometry.util.miscutils import patch_image
+# Bit-identical, ~2.5x faster replacement for
+# astrometry.util.miscutils.patch_image; see fast_patch.py.
+from fast_patch import patch_image
 from scipy.ndimage.morphology import binary_dilation
 
 def wise_l1b_maskinterp(l1b_image, l1b_mask, nointerp=False):
