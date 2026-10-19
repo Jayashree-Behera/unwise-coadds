@@ -1,5 +1,7 @@
 import os
 import sys
+import time
+import resource
 import numpy as np
 import fitsio
 import matplotlib
@@ -90,68 +92,68 @@ def exposure_overlaps_tile(exp_ra, exp_dec, tile_ra, tile_dec):
     return (cosc > 0) & (x > lo) & (x < hi) & (y > lo) & (y < hi)
     
 
-def get_exposures_for_tile(tile_ra, tile_dec, band_str, meta_dir, radius=1.7, overlap_only=True):
-    index_path = os.path.join(meta_dir, f'WISE-index-L1b_{band_str}.fits')
-    cat = fitsio.read(index_path)
+# def get_exposures_for_tile(tile_ra, tile_dec, band_str, meta_dir, radius=1.7, overlap_only=True):
+#     index_path = os.path.join(meta_dir, f'WISE-index-L1b_{band_str}.fits')
+#     cat = fitsio.read(index_path)
 
-    with open(os.path.join(meta_dir, 'l1b_dirs.yml'), 'r') as f:
-        l1b_dirs = yaml.safe_load(f)
+#     with open(os.path.join(meta_dir, 'l1b_dirs.yml'), 'r') as f:
+#         l1b_dirs = yaml.safe_load(f)
 
-    exp_coords = SkyCoord(ra=cat['RA'] * u.deg, dec=cat['DEC'] * u.deg)
-    tile_coord = SkyCoord(ra=tile_ra * u.deg,   dec=tile_dec * u.deg)
-    keep = exp_coords.separation(tile_coord) <= radius * u.deg
+#     exp_coords = SkyCoord(ra=cat['RA'] * u.deg, dec=cat['DEC'] * u.deg)
+#     tile_coord = SkyCoord(ra=tile_ra * u.deg,   dec=tile_dec * u.deg)
+#     keep = exp_coords.separation(tile_coord) <= radius * u.deg
 
-    if overlap_only:
-        n_circle = keep.sum()
-        keep &= exposure_overlaps_tile(cat['RA'], cat['DEC'], tile_ra, tile_dec)
-        print(f"    overlap filter: {n_circle} -> {keep.sum()} exposures")
+#     if overlap_only:
+#         n_circle = keep.sum()
+#         keep &= exposure_overlaps_tile(cat['RA'], cat['DEC'], tile_ra, tile_dec)
+#         print(f"    overlap filter: {n_circle} -> {keep.sum()} exposures")
 
-    matches = cat[keep]
-    paths = []
-    for row in matches:
-        phase = phase_from_scanid(row['SCAN_ID'])
-        wdir  = l1b_dirs[phase]
-        paths.append(os.path.join(
-            wdir,
-            f"{row['SCANGRP']}/{row['SCAN_ID']}/{row['FRAME_NUM']:03d}/"
-            f"{row['SCAN_ID']}{row['FRAME_NUM']:03d}-{band_str}-int-1b.fits"
-        ))
-    return paths
+#     matches = cat[keep]
+#     paths = []
+#     for row in matches:
+#         phase = phase_from_scanid(row['SCAN_ID'])
+#         wdir  = l1b_dirs[phase]
+#         paths.append(os.path.join(
+#             wdir,
+#             f"{row['SCANGRP']}/{row['SCAN_ID']}/{row['FRAME_NUM']:03d}/"
+#             f"{row['SCAN_ID']}{row['FRAME_NUM']:03d}-{band_str}-int-1b.fits"
+#         ))
+#     return paths
 
 
-def tile_center(cid):
-    """(ra, dec) in deg from a coadd_id, e.g. 2709p666 -> (270.9, 66.6)."""
-    ra = int(cid[:4]) / 10.0
-    dec = int(cid[-3:]) / 10.0 * (1 if cid[4] == "p" else -1)
-    return ra, dec
+# def tile_center(cid):
+#     """(ra, dec) in deg from a coadd_id, e.g. 2709p666 -> (270.9, 66.6)."""
+#     ra = int(cid[:4]) / 10.0
+#     dec = int(cid[-3:]) / 10.0 * (1 if cid[4] == "p" else -1)
+#     return ra, dec
  
  
-def find_valid_paths(tiles, band_str, meta_dir, radius=1.7, overlap_only=True, nthreads=32):
-    """
-    Union of exposures over all tiles (overlapping exposures processed once),
-    then keep those present on disk (plain or .gz).
+# def find_valid_paths(tiles, band_str, meta_dir, radius=1.7, overlap_only=True, nthreads=32):
+#     """
+#     Union of exposures over all tiles (overlapping exposures processed once),
+#     then keep those present on disk (plain or .gz).
 
-    Returns
-    -------
-    valid     : list of existing exposure paths (may end in .gz)
-    tile_sets : {coadd_id: set of index paths}, many-to-many membership,
-                used to group results per tile for plotting
-    """
-    all_paths, seen, tile_sets = [], set(), {}
-    for cid in tiles:
-        ra, dec = tile_center(cid)
-        paths = get_exposures_for_tile(ra, dec, band_str, meta_dir, radius=radius,
-                                       overlap_only=overlap_only)
-        tile_sets[cid] = set(paths)
-        new = [q for q in paths if q not in seen]
-        seen.update(new)
-        all_paths.extend(new)
-        print(f"  {cid}: {len(paths)} exposures ({len(new)} new)")
+#     Returns
+#     -------
+#     valid     : list of existing exposure paths (may end in .gz)
+#     tile_sets : {coadd_id: set of index paths}, many-to-many membership,
+#                 used to group results per tile for plotting
+#     """
+#     all_paths, seen, tile_sets = [], set(), {}
+#     for cid in tiles:
+#         ra, dec = tile_center(cid)
+#         paths = get_exposures_for_tile(ra, dec, band_str, meta_dir, radius=radius,
+#                                        overlap_only=overlap_only)
+#         tile_sets[cid] = set(paths)
+#         new = [q for q in paths if q not in seen]
+#         seen.update(new)
+#         all_paths.extend(new)
+#         print(f"  {cid}: {len(paths)} exposures ({len(new)} new)")
 
-    with ThreadPoolExecutor(max_workers=nthreads) as ex:
-        valid = [r for r in ex.map(existing_path, all_paths) if r is not None]
-    print(f"  Unique: {len(all_paths)}, on disk: {len(valid)}")
-    return valid, tile_sets
+#     with ThreadPoolExecutor(max_workers=nthreads) as ex:
+#         valid = [r for r in ex.map(existing_path, all_paths) if r is not None]
+#     print(f"  Unique: {len(all_paths)}, on disk: {len(valid)}")
+#     return valid, tile_sets
 
 
 _ATLAS_COORD_CACHE = {}
@@ -200,8 +202,7 @@ def get_overlapping_coadds(exp_ra, exp_dec, atlas_data, margin_deg=1.7, overlap_
         # radial margin that can't actually overlap this exposure, so
         # project_coadd_onto_exposure/project_unwisemask_onto_exposure don't
         # waste a resample_with_wcs call (and OverlapError) on them.
-        keep = exposure_overlaps_tile(exp_ra, exp_dec,
-                                      matched['CRVAL'][:, 0], matched['CRVAL'][:, 1])
+        keep = exposure_overlaps_tile(exp_ra, exp_dec, matched['CRVAL'][:, 0], matched['CRVAL'][:, 1])
         matched = matched[keep]
     return [cid.strip() for cid in matched['COADD_ID']]
 
@@ -650,68 +651,68 @@ def correct_single_exposure(exposure_path, atlas_data, model_dir, band_num, rele
     return (corrected_exposure, residual, work_res, stars_dn, hdr_exp, diagnostics)
 
 
-def plot_correction(exposure_path, corr_exp, work_res, diag, edges=False):
-    """
-    Two-panel diagnostic plot for one corrected L1b exposure.
-    Panel 1: Raw | Corrected | Difference (lane corrections applied)
-    Panel 2: Workspace column/row medians before and after lane correction
-    """
-    _, raw_exp, _ = load_exposure(exposure_path)
-    corr_work_res = diag['corrected_work_res']
-    lane_diff     = raw_exp - corr_exp
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle(
-        f"{os.path.basename(exposure_path)}\n"
-        f"Star pix masked: {diag['n_star_pix']} ({100*diag['n_star_pix']/raw_exp.size:.1f}%)  |  "
-        f"Work range: {diag['work_range']:.1f} DN  |  "
-        f"Skipped: {diag['skipped']}",
-        y=1.02
-    )
-    vlo, vhi = np.nanpercentile(raw_exp, [1, 99])
-    clim      = max(0.1, np.nanpercentile(np.abs(lane_diff), 99))
-    axes[0, 0].imshow(raw_exp,  vmin=vlo,   vmax=vhi,  cmap='binary',  origin='lower')
-    axes[0, 0].set_title('Raw Exposure (DN)')
-    axes[0, 1].imshow(corr_exp, vmin=vlo,   vmax=vhi,  cmap='binary',  origin='lower')
-    axes[0, 1].set_title('Corrected Exposure (DN)')
-    diff = axes[0, 2].imshow(lane_diff, vmin=-clim, vmax=clim, cmap='RdBu_r', origin='lower')
-    axes[0, 2].set_title(f'Lane Correction (raw − corrected)')
-    plt.colorbar(diff, ax=axes[0, 2], fraction=0.047, pad=0.02)
+# def plot_correction(exposure_path, corr_exp, work_res, diag, edges=False):
+#     """
+#     Two-panel diagnostic plot for one corrected L1b exposure.
+#     Panel 1: Raw | Corrected | Difference (lane corrections applied)
+#     Panel 2: Workspace column/row medians before and after lane correction
+#     """
+#     _, raw_exp, _ = load_exposure(exposure_path)
+#     corr_work_res = diag['corrected_work_res']
+#     lane_diff     = raw_exp - corr_exp
+#     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+#     fig.suptitle(
+#         f"{os.path.basename(exposure_path)}\n"
+#         f"Star pix masked: {diag['n_star_pix']} ({100*diag['n_star_pix']/raw_exp.size:.1f}%)  |  "
+#         f"Work range: {diag['work_range']:.1f} DN  |  "
+#         f"Skipped: {diag['skipped']}",
+#         y=1.02
+#     )
+#     vlo, vhi = np.nanpercentile(raw_exp, [1, 99])
+#     clim      = max(0.1, np.nanpercentile(np.abs(lane_diff), 99))
+#     axes[0, 0].imshow(raw_exp,  vmin=vlo,   vmax=vhi,  cmap='binary',  origin='lower')
+#     axes[0, 0].set_title('Raw Exposure (DN)')
+#     axes[0, 1].imshow(corr_exp, vmin=vlo,   vmax=vhi,  cmap='binary',  origin='lower')
+#     axes[0, 1].set_title('Corrected Exposure (DN)')
+#     diff = axes[0, 2].imshow(lane_diff, vmin=-clim, vmax=clim, cmap='RdBu_r', origin='lower')
+#     axes[0, 2].set_title(f'Lane Correction (raw − corrected)')
+#     plt.colorbar(diff, ax=axes[0, 2], fraction=0.047, pad=0.02)
 
-    if edges:
-        h, w = raw_exp.shape
-        lane_width = 64
-        for ax in [axes[0, 0], axes[0, 1]]:
-            # W1: vertical lines (column boundaries)
-            for x in range(lane_width, w, lane_width):
-                ax.axvline(x, color='cyan', lw=0.5, alpha=0.6, label='W1 lane' if x == lane_width else None)
-            # W2: horizontal lines (row boundaries)
-            for y in range(lane_width, h, lane_width):
-                ax.axhline(y, color='yellow', lw=0.5, alpha=0.6, label='W2 lane' if y == lane_width else None)
+#     if edges:
+#         h, w = raw_exp.shape
+#         lane_width = 64
+#         for ax in [axes[0, 0], axes[0, 1]]:
+#             # W1: vertical lines (column boundaries)
+#             for x in range(lane_width, w, lane_width):
+#                 ax.axvline(x, color='cyan', lw=0.5, alpha=0.6, label='W1 lane' if x == lane_width else None)
+#             # W2: horizontal lines (row boundaries)
+#             for y in range(lane_width, h, lane_width):
+#                 ax.axhline(y, color='yellow', lw=0.5, alpha=0.6, label='W2 lane' if y == lane_width else None)
 
-    corr_work_res_masked = corr_work_res.copy()
-    corr_work_res_masked[~np.isfinite(work_res)] = np.nan  # same mask as work_res
-    for data, label, color in [
-        (work_res,            'Before', 'C0'),
-        (corr_work_res_masked,'After',  'C1'),
-    ]:
-        col_med = np.nanmedian(data, axis=0)
-        row_med = np.nanmedian(data, axis=1)
-        axes[1, 0].plot(col_med - np.nanmedian(col_med), alpha=0.7, label=label, color=color)
-        axes[1, 1].plot(row_med - np.nanmedian(row_med), alpha=0.7, label=label, color=color)
-    axes[1, 0].set_title('Column medians (workspace)')
-    axes[1, 1].set_title('Row medians (workspace)')
-    cov = axes[1, 2].imshow(diag['weight'], vmin=0, vmax=4, cmap='viridis', origin='lower')
-    axes[1, 2].set_title('Coadd coverage (n tiles)')
-    plt.colorbar(cov, ax=axes[1, 2], fraction=0.047, pad=0.02)
-    for ax in axes[1, :2]:
-        ax.axhline(0, color='k', lw=0.5)
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-    for ax in axes[0].ravel():
-        ax.set_xticks([]); ax.set_yticks([])
-    axes[1, 0].set_xlabel('Column index'); axes[1, 0].set_ylabel('Median DN (recentred)')
-    axes[1, 1].set_xlabel('Row index');    axes[1, 1].set_ylabel('Median DN (recentred)')
-    plt.tight_layout()
+#     corr_work_res_masked = corr_work_res.copy()
+#     corr_work_res_masked[~np.isfinite(work_res)] = np.nan  # same mask as work_res
+#     for data, label, color in [
+#         (work_res,            'Before', 'C0'),
+#         (corr_work_res_masked,'After',  'C1'),
+#     ]:
+#         col_med = np.nanmedian(data, axis=0)
+#         row_med = np.nanmedian(data, axis=1)
+#         axes[1, 0].plot(col_med - np.nanmedian(col_med), alpha=0.7, label=label, color=color)
+#         axes[1, 1].plot(row_med - np.nanmedian(row_med), alpha=0.7, label=label, color=color)
+#     axes[1, 0].set_title('Column medians (workspace)')
+#     axes[1, 1].set_title('Row medians (workspace)')
+#     cov = axes[1, 2].imshow(diag['weight'], vmin=0, vmax=4, cmap='viridis', origin='lower')
+#     axes[1, 2].set_title('Coadd coverage (n tiles)')
+#     plt.colorbar(cov, ax=axes[1, 2], fraction=0.047, pad=0.02)
+#     for ax in axes[1, :2]:
+#         ax.axhline(0, color='k', lw=0.5)
+#         ax.legend(fontsize=8)
+#         ax.grid(True, alpha=0.3)
+#     for ax in axes[0].ravel():
+#         ax.set_xticks([]); ax.set_yticks([])
+#     axes[1, 0].set_xlabel('Column index'); axes[1, 0].set_ylabel('Median DN (recentred)')
+#     axes[1, 1].set_xlabel('Row index');    axes[1, 1].set_ylabel('Median DN (recentred)')
+#     plt.tight_layout()
 
 
 def save_corrected_exposure(corrected_exposure, hdr_exp, output_path, stats=None):
@@ -997,7 +998,7 @@ def wise_frame_to_l1b_path(wise, band, int_gz=False):
 
 
 def correct_exposures_for_tile(WISE, band_num, model_dir, release, atlas_path,
-                                corr_outdir, coadd_id=None, nthreads=16,
+                                corr_outdir, coadd_id=None, l1b_corr_threads=16,
                                 force=False, int_gz=False, use_zp_meta=False):
     """
     Background/star/lane-correct the L1b exposures in `WISE` (already cut down
@@ -1025,7 +1026,7 @@ def correct_exposures_for_tile(WISE, band_num, model_dir, release, atlas_path,
     atlas_data = fitsio.read(atlas_path)
 
     results = [None] * len(valid_paths)
-    with Pool(processes=nthreads, initializer=init_worker,
+    with Pool(processes=l1b_corr_threads, initializer=init_worker,
               initargs=(atlas_data, model_dir, band_num, corr_outdir, release, force, use_zp_meta)) as pool:
         for idx, status, stats in pool.imap_unordered(process_one_exposure, list(enumerate(valid_paths))):
             results[idx] = {'path': valid_paths[idx], 'status': status, **(stats or {})}
@@ -1076,9 +1077,8 @@ def _init_unwise_coadd_globals(int_gz=False, use_zp_meta=False):
 
 def run_corrected_coadd(coadd_id, band_num, model_dir, release, atlas_path,
                          corr_outdir, final_outdir, W=2048, H=2048, pixscale=2.75,
-                         nthreads=16, force_bg=False, force=False, int_gz=False,
-                         make_plots=True, one_coadd_kwargs=None,
-                         save_corrected_images=False, use_zp_meta=False):
+                         l1b_corr_threads=16, force_bg=False, force=False, int_gz=False,
+                         make_plots=True, one_coadd_kwargs=None, use_zp_meta=False):
     """
     End-to-end: select the L1b exposures unwise_coadd would use for one coadd
     tile, background-correct only those, then build the final coadd from the
@@ -1087,15 +1087,7 @@ def run_corrected_coadd(coadd_id, band_num, model_dir, release, atlas_path,
 
     corr_outdir: where corrected int/unc/msk triplets are written. If None,
         a private temporary directory is created and used instead (and
-        always cleaned up afterwards, regardless of save_corrected_images,
-        since the caller never named a path it could reuse).
-    save_corrected_images: if True, leave the corrected L1b files in
-        corr_outdir after the run (useful to reuse/cache them across
-        overlapping tiles, or for inspection/debugging). If False, the
-        corrected files are deleted once the coadd has been built -- but
-        only when corr_outdir was auto-created here; an explicitly-passed
-        corr_outdir is never auto-deleted, since it may be a shared cache
-        directory used by other runs/tiles.
+        always cleaned up afterwards.
     use_zp_meta: same flag/semantics as unwise_coadd.py's own --use_zp_meta.
         Default False: both the stripe correction and the final coadd get
         their per-frame zeropoint from zp_lookup.ZPLookUp(band, poly=True).
@@ -1125,7 +1117,7 @@ def run_corrected_coadd(coadd_id, band_num, model_dir, release, atlas_path,
 
     results, missing = correct_exposures_for_tile(
         WISE_corr, band_num, model_dir, release, atlas_path, corr_outdir,
-        coadd_id=coadd_id, nthreads=nthreads, force=force_bg, int_gz=int_gz,
+        coadd_id=coadd_id, l1b_corr_threads=l1b_corr_threads, force=force_bg, int_gz=int_gz,
         use_zp_meta=use_zp_meta)
 
     if make_plots and results:
@@ -1168,7 +1160,7 @@ def run_corrected_coadd(coadd_id, band_num, model_dir, release, atlas_path,
     finally:
         os.chdir(cwd)
         unwise_coadd.get_l1b_file = orig_get_l1b_file
-        if owns_corr_outdir and not save_corrected_images:
+        if owns_corr_outdir:
             shutil.rmtree(corr_outdir, ignore_errors=True)
 
     if fallback_log:
@@ -1176,6 +1168,38 @@ def run_corrected_coadd(coadd_id, band_num, model_dir, release, atlas_path,
               f'L1b data (not background-corrected): {fallback_log}')
 
     return rtn
+
+
+def _log_resource_usage(tile, band, wall_start, cpu_start):
+    """Print a one-line wall/CPU time + memory-usage summary, e.g. for
+    comparing cost across tiles (pole tiles vs. typical tiles)."""
+    wall = time.time() - wall_start
+    # Include children (worker processes spawned via multiprocessing) so the
+    # CPU total reflects the full multi-process coadd, not just the parent.
+    usage_self = resource.getrusage(resource.RUSAGE_SELF)
+    usage_children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = (usage_self.ru_utime + usage_self.ru_stime +
+           usage_children.ru_utime + usage_children.ru_stime) - cpu_start
+    # ru_maxrss is in KB on Linux.
+    maxrss_mb = max(usage_self.ru_maxrss, usage_children.ru_maxrss) / 1024.0
+
+    vm = {}
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                for key in ('VmPeak', 'VmSize', 'VmRSS', 'VmData'):
+                    if line.startswith(key + ':'):
+                        vm[key] = int(line.split()[1]) / 1024.0  # kB -> MB
+    except OSError:
+        pass
+
+    print(f'Tile {tile} band {band} took: '
+          f'Wall: {wall:.2f} s, CPU: {cpu:.2f} s, '
+          f'VmPeak: {vm.get("VmPeak", float("nan")):.0f} MB, '
+          f'VmSize: {vm.get("VmSize", float("nan")):.0f} MB, '
+          f'VmRSS: {vm.get("VmRSS", float("nan")):.0f} MB, '
+          f'VmData: {vm.get("VmData", float("nan")):.0f} MB, '
+          f'maxrss: {maxrss_mb:.6f} MB')
 
 
 def main():
@@ -1188,18 +1212,11 @@ def main():
     parser.add_argument('--release', required=True, help='unwise release tag used to find -msk.fits.gz artifact masks')
     parser.add_argument('--atlas', required=True, help='atlas FITS table with CRVAL and COADD_ID columns')
     parser.add_argument('--corr-outdir', default=None,
-                      help=('directory to write background-corrected L1b files. '
-                            'Default: a private temporary directory, which is deleted '
-                            'after the coadd is built unless --save-corrected-images is given.'))
-    parser.add_argument('--save-corrected-images', dest='save_corrected_images', action='store_true',
-                      default=False,
-                      help=('keep the background-corrected L1b files in --corr-outdir after the run '
-                            '(e.g. to reuse/cache them across overlapping tiles, or for inspection). '
-                            'Default: delete them once the coadd has been built. Has no effect -- the '
-                            'files are never auto-deleted -- if --corr-outdir was explicitly given, '
-                            'since that directory may be a shared cache used by other runs.'))
+                        help=('directory to write background-corrected L1b files. '
+                              'Default: a private temporary directory, deleted after the coadd is built.'))
     parser.add_argument('--outdir', required=True, help='final coadd output directory')
-    parser.add_argument('--nthreads', type=int, default=16)
+    parser.add_argument('--l1b-corr-threads', dest='l1b_corr_threads', type=int, default=16, 
+                        help='Worker processes for correcting L1b exps (separate from --threads/threads1, that control unwise_coadd.py\'s own round 1/2 coaddition).')
     parser.add_argument('--force-bg', action='store_true', help='re-run correction even if cached output exists')
     parser.add_argument('--no-plots', dest='no_plots', action='store_true', help='skip writing diagnostic plots/CSVs')
 
@@ -1289,14 +1306,20 @@ def main():
         output_masks=args.output_masks, mp1=mp1, mp2=mp2,
     )
 
-    rtn = run_corrected_coadd(
-        args.tile, args.band, args.model_dir, args.release, args.atlas,
-        args.corr_outdir, args.outdir, nthreads=args.nthreads,
-        force_bg=args.force_bg, force=args.force,
-        make_plots=not args.no_plots, one_coadd_kwargs=one_coadd_kwargs,
-        save_corrected_images=args.save_corrected_images,
-        use_zp_meta=args.use_zp_meta,
-    )
+    wall_start = time.time()
+    usage0 = resource.getrusage(resource.RUSAGE_SELF)
+    children0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_start = usage0.ru_utime + usage0.ru_stime + children0.ru_utime + children0.ru_stime
+    try:
+        rtn = run_corrected_coadd(
+            args.tile, args.band, args.model_dir, args.release, args.atlas,
+            args.corr_outdir, args.outdir, l1b_corr_threads=args.l1b_corr_threads,
+            force_bg=args.force_bg, force=args.force,
+            make_plots=not args.no_plots, one_coadd_kwargs=one_coadd_kwargs,
+            use_zp_meta=args.use_zp_meta,
+        )
+    finally:
+        _log_resource_usage(args.tile, args.band, wall_start, cpu_start)
     return rtn
 
 

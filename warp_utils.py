@@ -418,6 +418,9 @@ def parse_write_quadrant_masks(outdir, tag, WISE, qmasks, int_gz, ofn, ti, outpu
         WISE.npixpatched[exp_mask] += qmask.npatched
         WISE.npixrchi[exp_mask] += qmask.nrchipix
         WISE.weight[exp_mask] = qmask.w
+        if qmask.destripe is not None:
+            for k,v in qmask.destripe.items():
+                WISE.get(k.lower())[exp_mask] = v
 
     # call merge_write_quadrant_masks to actually write the bitmask images
     if output_masks:

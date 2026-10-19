@@ -1,4 +1,7 @@
 import os
+import shutil
+import tempfile
+import time
 import numpy as np
 from astrometry.util.util import Tan
 import fitsio
@@ -146,23 +149,107 @@ def _rebin(a, shape):
     sh = shape[0],a.shape[0]//shape[0],shape[1],a.shape[1]//shape[1]
     return a.reshape(sh).mean(-1).mean(1)
 
-def download_frameset_1band(scan_id, frame_num, band):
-    
+def l1b_triplet_paths(intfn, int_gz=False):
+    """The three files a frame needs: intensity, uncertainty and mask.
+    Mirrors how unwise_coadd.py derives the unc/msk names from the int name."""
+    suffix = '' if int_gz else '.gz'
+    return (intfn,
+            intfn.replace('-int-', '-unc-') + suffix,
+            intfn.replace('-int-', '-msk-') + suffix)
+
+def clear_partial_l1b_triplet(intfn, int_gz=False, min_age_s=900):
+    """Delete a partially-downloaded frame so the next download starts clean.
+
+    An interrupted download (out of disk quota, killed job) can leave one or
+    two of the three files behind. The frame is unusable, but the files that
+    are present make the cache look populated, so it is silently skipped on
+    this and every subsequent run. Removing the stragglers lets wget refetch
+    the whole set.
+
+    `min_age_s` guards against another job that is downloading this same frame
+    right now: a set that was touched recently is left alone rather than
+    deleted out from under it.
+
+    Only ever call this on a directory we own -- never on the read-only
+    survey directories. Returns the number of files removed.
+    """
+    paths = l1b_triplet_paths(intfn, int_gz)
+    present = [p for p in paths if os.path.exists(p)]
+    if len(present) in (0, len(paths)):
+        return 0
+    now = time.time()
+    for p in present:
+        try:
+            if now - os.path.getmtime(p) < min_age_s:
+                return 0
+        except OSError:
+            return 0
+    nremoved = 0
+    for p in present:
+        try:
+            os.remove(p)
+            nremoved += 1
+        except OSError as e:
+            print('WARNING: could not remove partial L1b file', p, e)
+    return nremoved
+
+def download_frameset_1band(scan_id, frame_num, band, dest_dir=None):
+
     wdir = '_' # dummy
 
     intfn = get_l1b_file(wdir, scan_id, frame_num, band)
     intfnx = intfn.replace(wdir+'/', '')
+    url = ('http://irsa.ipac.caltech.edu/ibe/data/wise/merge/merge_p1bm_frm/%s/'
+           % os.path.dirname(intfnx))
 
-    # Try to download the file from IRSA.
-    cmd = (('(wget -r -N -nH -np -nv --cut-dirs=4 -A "*w%i*" ' +
-            '"http://irsa.ipac.caltech.edu/ibe/data/wise/merge/merge_p1bm_frm/%s/")') %
-           (band, os.path.dirname(intfnx)))
-    print()
-    print('Trying to download file:')
-    print(cmd)
-    print()
-    os.system(cmd)
-    print()
+    def run(cmd):
+        print()
+        print('Trying to download file:')
+        print(cmd)
+        print()
+        os.system(cmd)
+        print()
+
+    if dest_dir is None:
+        # Legacy behaviour: wget writes relative to the current directory.
+        run('(wget -r -N -nH -np -nv --cut-dirs=4 -A "*w%i*" "%s")' % (band, url))
+        return
+
+    # Download into a private staging directory and move the finished files
+    # into place, so that several jobs can share one cache. A half-written
+    # frame is never visible to anyone else: os.replace is atomic within a
+    # filesystem, so another job sees either nothing or the complete file.
+    final_dir = os.path.dirname(get_l1b_file(dest_dir, scan_id, frame_num, band))
+    try:
+        os.makedirs(final_dir, exist_ok=True)
+        staging = tempfile.mkdtemp(prefix='.dl-', dir=dest_dir)
+    except OSError as e:
+        print('WARNING: cannot stage download under', dest_dir, e)
+        return
+    try:
+        # --cut-dirs=5 drops the merge_p1bm_frm component too, so the tree
+        # lands directly under the staging dir and mirrors get_l1b_file.
+        run('(wget -r -N -nH -np -nv --cut-dirs=5 -P "%s" -A "*w%i*" "%s")'
+            % (staging, band, url))
+        moves = []
+        for dirpath, _, fns in os.walk(staging):
+            for fn in fns:
+                # skip wget's index.html / robots.txt scaffolding
+                if fn.startswith(scan_id):
+                    moves.append((os.path.join(dirpath, fn),
+                                  os.path.join(final_dir, fn)))
+        # Publish the intensity image last. Callers test for it first and only
+        # then look for the uncertainty and mask, so this ordering means a
+        # concurrent reader never sees an intensity image whose companions
+        # have not arrived yet.
+        moves.sort(key=lambda m: '-int-' in os.path.basename(m[0]))
+        for src, dst in moves:
+            try:
+                os.replace(src, dst)
+            except OSError as e:
+                print('WARNING: could not install downloaded file', dst, e)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 def planet_name2bit(_name):
     name = _name.lower()

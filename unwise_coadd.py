@@ -16,7 +16,7 @@ from scipy.ndimage import binary_dilation, label
 from zp_lookup import ZPLookUp
 import random
 from warp_utils import WarpMetaParameters, mask_extreme_pix, compute_warp, apply_warp, gen_warp_table, update_included_bitmask, parse_write_quadrant_masks, RecoveryStats, pad_rebin_weighted, ReferenceImage, QuadrantWarp, reference_image_from_dir
-from unwise_utils import tile_to_radec, int_from_scan_frame, zeropointToScale, retrieve_git_version, get_dir_for_coadd, get_epoch_breaks, get_coadd_tile_wcs, get_l1b_file, download_frameset_1band, sanity_check_inputs, phase_from_scanid, header_reference_keywords, get_l1b_dirs, is_nearby, good_scan_mask, ascending
+from unwise_utils import tile_to_radec, int_from_scan_frame, zeropointToScale, retrieve_git_version, get_dir_for_coadd, get_epoch_breaks, get_coadd_tile_wcs, get_l1b_file, download_frameset_1band, clear_partial_l1b_triplet, sanity_check_inputs, phase_from_scanid, header_reference_keywords, get_l1b_dirs, is_nearby, good_scan_mask, ascending
 from hi_lo import HiLo
 
 import fitsio
@@ -58,6 +58,15 @@ unc_gz = True
 int_gz = None # should get assigned in main
 use_zp_meta = None # should get assigned in main
 compare_moon_all = None # should get assigned in main
+# --destripe: a (atlas_data, model_dir, release, band) tuple, or None for no
+# stripe/background correction of the L1b frames before coaddition
+destripe_ctx = None # should get assigned in main
+# --save-corrected-images: directory for the stripe-corrected L1b frames, or None
+destripe_save_dir = None # should get assigned in main
+# --destripe-cache: reuse already-saved corrected frames from destripe_save_dir?
+destripe_use_cache = False # should get assigned in main
+# --force-bg: rewrite saved corrected frames even if they already exist?
+destripe_force = False # should get assigned in main
 
 class FirstRoundCoadd():
     def __init__(self, coimg1, cow1, coppstd1, cowimgsq1, con1):
@@ -97,6 +106,7 @@ class FirstRoundImage():
         self.rimg_bak = None # for debugging only; once warping performed, will hold raw image
         self.scan_id = None
         self.frame_num = None
+        self.destripe = None # stripe-correction stats, if --destripe
 
     def clear_xy_coords(self):
         print("deleting x, y coordinates for quadrant " + str(self.quadrant))
@@ -116,6 +126,7 @@ class SecondRoundImage():
         self.w = None
         self.included = None
         self.omask = None
+        self.destripe = None # stripe-correction stats, if --destripe
 
         self.coslc = None
         self.coimgsq = None
@@ -1098,13 +1109,25 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
             download = False
             if wdir is None:
                 download = try_download
-                wdir = 'merge_p1bm_frm'
+                # Download into the 'missing' directory from l1b_dirs.yml rather
+                # than a cwd-relative path, so frames land in shared storage and
+                # are found by the wdirs['missing'] pass on later runs.
+                wdir = wdirs['missing']
 
             # the intensity image filename
             intfn = get_l1b_file(wdir, wise.scan_id, wise.frame_num, band, int_gz=int_gz)
 
             if download:
-                download_frameset_1band(wise.scan_id, wise.frame_num, band)
+                # An earlier interrupted download can leave one or two of the
+                # three files behind. That frame is unusable, but looks present
+                # enough to be skipped rather than refetched, so it would stay
+                # broken forever. Clear it before asking wget for the set.
+                nrm = clear_partial_l1b_triplet(intfn, int_gz=int_gz)
+                if nrm:
+                    print('Removed %i file(s) of an incomplete frame before '
+                          're-downloading:' % nrm, intfn)
+                download_frameset_1band(wise.scan_id, wise.frame_num, band,
+                                        dest_dir=wdirs['missing'])
 
             if not os.path.exists(intfn):
                 debug('does not exist:', intfn)
@@ -1267,6 +1290,9 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     hdr.add_record(dict(name='UNW_FRNR', value=nframes_random, comment='unWISE N random frames'))
     hdr.add_record(dict(name='UNW_MEDF', value=medfilt, comment='unWISE median filter sz'))
     hdr.add_record(dict(name='UNW_BGMA', value=bgmatch, comment='unWISE background matching?'))
+    if destripe_ctx is not None:
+        hdr.add_record(dict(name='UNW_DSTR', value=True,
+                            comment='unWISE L1b stripe correction?'))
 
     referen1, referen2 = header_reference_keywords(reference_dir)
     hdr.add_record(dict(name='REFEREN1', value=referen1, comment='reference coadd directory'))
@@ -1290,6 +1316,14 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     WISE.npixpatched = np.zeros(len(WISE), np.int32)
     WISE.npixrchi    = np.zeros(len(WISE), np.int32)
     WISE.weight      = np.zeros(len(WISE), np.float32)
+    if destripe_ctx is not None:
+        # per-frame stripe-correction stats; see destripe_utils._collect_stats
+        from destripe_utils import STATS_KEYS
+        for k in STATS_KEYS:
+            if k == 'BGSTAT':
+                WISE.set(k.lower(), np.array([''] * len(WISE), dtype='U8'))
+            else:
+                WISE.set(k.lower(), np.zeros(len(WISE), np.float32))
 
     if not warp_all:
         Iused = np.flatnonzero(WISE.use & ~(WISE.moon_rej | (WISE.nearby_planets != 0))) # hack !!!!!
@@ -1596,6 +1630,9 @@ def parse_write_masks(outdir, tag, WISE, Iused, masks, int_gz, ofn, ti, output_m
         WISE.npixpatched[ii] = mm.npatched
         WISE.npixrchi   [ii] = mm.nrchipix
         WISE.weight     [ii] = mm.w
+        if mm.destripe is not None:
+            for k,v in mm.destripe.items():
+                WISE.get(k.lower())[ii] = v
 
         if not mm.included:
             continue
@@ -1645,6 +1682,7 @@ def _coadd_one_round2(X):
     mm.pa       = rr.pa
     mm.ascending = rr.ascending
     mm.w        = rr.w
+    mm.destripe = rr.destripe
     mm.included = 1
 
     cox0,cox1,coy0,coy1 = rr.coextent
@@ -2496,6 +2534,57 @@ def subtract_coadd_sky(coimg, coimgb, con):
 
     return coimg, coimgb, sky
 
+def _destripe_frame(fullimg, fullmask, fullunc, maskbits, wcs, zp, ihdr, intfn):
+    '''
+    Remove the stripe pattern from a full L1b frame (--destripe).
+
+    Returns the corrected image and a dict of per-frame stats. If the
+    correction fails, the image is returned uncorrected, with stats
+    BGSTAT = "FAILED".
+    '''
+    import destripe_utils
+    ofn = None
+    if destripe_save_dir is not None:
+        ofn = destripe_utils.corrected_frame_path(destripe_save_dir, intfn)
+        if destripe_use_cache:
+            # The correction depends only on per-frame inputs, so a frame
+            # corrected for any other tile is reusable here. Read it at the
+            # point of use (not via a path resolved earlier) and fall through
+            # to recomputing if anything at all goes wrong.
+            cached = destripe_utils.load_corrected_exposure(
+                ofn, shape=fullimg.shape, correct_channels=destripe_ctx[4])
+            if cached is not None:
+                debug('Destripe: cached', ofn)
+                return cached
+
+    fullgood = ((fullmask & maskbits) == 0)
+    fullgood[fullunc == 0] = False
+    fullgood[np.logical_not(np.isfinite(fullimg))] = False
+    fullgood[np.logical_not(np.isfinite(fullunc))] = False
+
+    atlas_data, model_dir, release, destripe_band, correct_channels = destripe_ctx
+    t0 = Time()
+    try:
+        corrected, stats = destripe_utils.destripe_frame(
+            fullimg, fullgood, wcs, zp, float(ihdr['CRVAL1']), float(ihdr['CRVAL2']),
+            atlas_data, model_dir, destripe_band, release,
+            correct_channels=correct_channels)
+    except Exception:
+        import traceback
+        print('WARNING: stripe correction failed; using uncorrected frame', intfn)
+        traceback.print_exc()
+        return fullimg, destripe_utils.failed_stats()
+    debug('Destripe:', stats['BGSTAT'], Time() - t0)
+
+    if ofn is not None and stats['BGSTAT'] == 'OK':
+        # Only 'OK' frames are actually modified, so only those are worth
+        # saving; 'NOPROJ'/'BIGSKY' frames bail out early and are cheap to redo.
+        if destripe_force or not os.path.exists(ofn):
+            destripe_utils.save_corrected_exposure(corrected, ihdr, ofn, stats=stats,
+                                                   correct_channels=correct_channels)
+            debug('Wrote', ofn)
+    return corrected, stats
+
 def _coadd_one_round1(X, store_xy_coords=False):
     '''
     For multiprocessing, the function called to do round 1 on a single
@@ -2563,6 +2652,13 @@ def _coadd_one_round1(X, store_xy_coords=False):
             badbits.append(23)
 
     maskbits = sum([1<<bit for bit in badbits])
+
+    destripe_stats = None
+    if destripe_ctx is not None:
+        fullimg, destripe_stats = _destripe_frame(fullimg, fullmask, fullunc, maskbits,
+                                                  wcs_full, zp, ihdr, intfn)
+        img = fullimg[slc]
+
     goodmask = ((mask & maskbits) == 0)
     goodmask[unc == 0] = False
     goodmask[np.logical_not(np.isfinite(img))] = False
@@ -2748,6 +2844,7 @@ def _coadd_one_round1(X, store_xy_coords=False):
     rr.cowcs_full = cowcs
     rr.scan_id = wise.scan_id
     rr.frame_num = wise.frame_num
+    rr.destripe = destripe_stats
 
     if store_xy_coords:
         rr.x_l1b = Xi
@@ -2976,6 +3073,24 @@ def _coadd_wise_round1(cowcs, WISE, ps, band, table, L, tinyw, mp, medfilt,
     r1_coadd = FirstRoundCoadd(coimg, cow, coppstd, coimgsq, con1)
     return rimgs, r1_coadd, rstats, cube
 
+def get_destripe_context(band, model_dir, release, atlas_path, correct_channels=False):
+    '''
+    Set up the inputs for the L1b stripe correction (--destripe): the atlas
+    tile table (coadd_id, ra, dec) and the model/mask directories.
+    '''
+    import destripe_utils
+    # Resolve the crowdsource dependency here rather than per-frame:
+    # _destripe_frame catches everything and falls back to the uncorrected
+    # image, so a missing dependency would otherwise silently produce a
+    # completely uncorrected coadd.
+    destripe_utils.get_sky_im()
+    if not os.path.isdir(model_dir):
+        raise RuntimeError('--destripe-model-dir does not exist: %s' % model_dir)
+    if not os.path.exists(atlas_path):
+        raise RuntimeError('--destripe-atlas does not exist: %s' % atlas_path)
+    atlas_data = fitsio.read(atlas_path)
+    return (atlas_data, model_dir, release, band, correct_channels)
+
 def main():
     import argparse
     from astrometry.util.multiproc import multiproc
@@ -3102,6 +3217,29 @@ def main():
                       help='Include a min/max rejection stpe during first round coaddition.')
     parser.add_argument('--no_output_masks', dest='output_masks', action='store_false', default=True,
                       help='Turn off writing of per-exposure mask outputs.')
+    parser.add_argument('--destripe', dest='destripe', action='store_true', default=False,
+                      help='Remove the per-channel stripe pattern from the W1/W2 L1b frames before coadding?')
+    parser.add_argument('--destripe-model-dir', dest='destripe_model_dir', default=None,
+                      help='For --destripe: directory of crowdsource model images, <coadd_id>.<band>.mod.fits')
+    parser.add_argument('--destripe-release', dest='destripe_release', default=None,
+                      help='For --destripe: unwise release tag used to find -msk.fits.gz artifact masks')
+    parser.add_argument('--destripe-atlas', dest='destripe_atlas', default=None,
+                      help='For --destripe: atlas FITS table with CRVAL and COADD_ID columns')
+    parser.add_argument('--save-corrected-images', dest='save_corrected_images',
+                      nargs='?', const='', default=None, metavar='DIR',
+                      help=('For --destripe: also write the stripe-corrected L1b intensity images, '
+                            'to DIR (default: <outdir>/corrected-frames)'))
+    parser.add_argument('--destripe-channels', dest='destripe_channels', action='store_true',
+                      default=False,
+                      help=('For --destripe: also remove a constant offset per 64-pixel readout '
+                            'channel, after the row-level correction'))
+    parser.add_argument('--destripe-cache', dest='destripe_cache', action='store_true',
+                      default=False,
+                      help=('For --save-corrected-images: reuse already-saved corrected frames '
+                            'instead of recomputing them'))
+    parser.add_argument('--force-bg', dest='force_bg', action='store_true', default=False,
+                      help=('For --save-corrected-images: recompute and overwrite saved corrected '
+                            'frames even if they already exist (overrides --destripe-cache)'))
     parser.add_argument('-v', '--verbose', dest='verbose', action='count',
                         default=0, help='Make more verbose')
 
@@ -3126,6 +3264,36 @@ def main():
 
     global compare_moon_all
     compare_moon_all = opt.compare_moon_all
+
+    # (this needs to happen before the multiprocessing pools are created)
+    global destripe_ctx
+    global destripe_save_dir
+    global destripe_use_cache
+    global destripe_force
+    if opt.destripe:
+        if not opt.band in [None, 1, 2]:
+            parser.error('--destripe only applies to W1 and W2')
+        if (opt.destripe_model_dir is None or opt.destripe_release is None
+                or opt.destripe_atlas is None):
+            parser.error('--destripe requires --destripe-model-dir, '
+                         '--destripe-release, and --destripe-atlas')
+        destripe_ctx = get_destripe_context(opt.band or 1, opt.destripe_model_dir,
+                                            opt.destripe_release, opt.destripe_atlas,
+                                            correct_channels=opt.destripe_channels)
+        if opt.save_corrected_images is not None:
+            destripe_save_dir = (opt.save_corrected_images or
+                                 os.path.join(opt.outdir, 'corrected-frames'))
+            destripe_force = opt.force_bg
+            destripe_use_cache = opt.destripe_cache and not opt.force_bg
+            print('Writing stripe-corrected L1b frames to', destripe_save_dir,
+                  '(reusing existing ones)' if destripe_use_cache else
+                  '(overwriting existing ones)' if destripe_force else '')
+    elif opt.save_corrected_images is not None:
+        parser.error('--save-corrected-images requires --destripe')
+    if opt.destripe_channels and not opt.destripe:
+        parser.error('--destripe-channels requires --destripe')
+    if (opt.destripe_cache or opt.force_bg) and destripe_save_dir is None:
+        parser.error('--destripe-cache / --force-bg require --save-corrected-images')
 
     if opt.threads:
         mp2 = multiproc(opt.threads)
@@ -3227,7 +3395,12 @@ def main():
             kwargs.update({ to: kwargs.pop(fr) })
         for key in ['threads', 'threads1', 'plots', 'pdf', 'plotprefix',
                     'size', 'width', 'height', 'ra', 'dec', 'band', 'name',
-                    'tile', 'preprocess', 'grid', 'verbose']:
+                    'tile', 'preprocess', 'grid', 'verbose',
+                    # --destripe options are read from module globals set in
+                    # main(), not passed through to one_coadd()
+                    'destripe', 'destripe_model_dir', 'destripe_release',
+                    'destripe_atlas', 'save_corrected_images', 'destripe_cache',
+                    'destripe_channels', 'force_bg']:
             kwargs.pop(key)
 
         orig_name = tile.coadd_id
