@@ -32,7 +32,9 @@ TILES="${TILE:-1869p121}"
 BANDS="1 2"
 FORCE=1
 FORCE_BG=0
-THREAD_ARGS="${THREAD_ARGS:---threads1 16}"
+# No colon: an explicitly empty THREAD_ARGS means "pass no thread
+# flags", which is how the automatic sizing is exercised.
+THREAD_ARGS="${THREAD_ARGS---threads1 16}"
 TIMING="${TIMING:-0}"
 MODE="${MODE:-plain}"
 TAG="${TAG:?set TAG}"

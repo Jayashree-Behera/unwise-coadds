@@ -19,7 +19,7 @@ from warp_utils import WarpMetaParameters, mask_extreme_pix, compute_warp, apply
 from unwise_utils import tile_to_radec, int_from_scan_frame, zeropointToScale, retrieve_git_version, get_dir_for_coadd, get_epoch_breaks, get_coadd_tile_wcs, get_l1b_file, download_frameset_1band, clear_partial_l1b_triplet, sanity_check_inputs, phase_from_scanid, header_reference_keywords, get_l1b_dirs, is_nearby, good_scan_mask, ascending
 from hi_lo import HiLo
 from pipeline_timing import stage as timing_stage, tick as timing_tick, \
-    report_now as timing_report_now
+    report_now as timing_report_now, start as timing_start, stop as timing_stop
 
 import fitsio
 
@@ -787,18 +787,23 @@ def choose_threads(nframes, want1, want2):
     # parent in order, so it stops scaling well past a handful of workers.
     n2 = max(1, min(n1, 16))
 
+    # Report what is actually used, not what the automatic sizing computed,
+    # so an explicitly requested count is not misreported in the log.
+    use1 = n1 if auto1 else want1
+    use2 = n2 if auto2 else want2
     print('Thread sizing: %i cores available, %i exposures, %s memory; '
-          'round 1 -> %i, round 2 -> %i'
+          'round 1 -> %s, round 2 -> %s'
           % (ncpu, nframes,
              ('%.0f GB' % (mem / (1024.**3))) if mem else 'unknown',
-             n1, n2))
+             '%i (auto)' % use1 if auto1 else '%s (requested)' % use1,
+             '%i (auto)' % use2 if auto2 else '%s (requested)' % use2))
     if budget_mb is not None:
         print('  round-1 image list ~%.0f GB, leaving ~%.0f GB for workers '
               '(~%.0f MB each)'
               % (rimg_mb / 1024., max(0., budget_mb) / 1024.,
                  ROUND1_WORKER_MB))
 
-    return (n1 if auto1 else want1), (n2 if auto2 else want2)
+    return use1, use2
 
 class _PoolGate(object):
     '''
@@ -1706,6 +1711,7 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
 
     # "Unmasked" versions
     ofn = prefix + '-img-u.fits'
+    timing_start('PHASE_write_planes')
     fitsio.write(ofn, coim.astype(np.float32), header=hdr, clobber=True, extname='coadded image, outliers patched')
     print('Wrote', ofn)
 
@@ -1756,6 +1762,7 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
         fitsio.write(ofn, comax.astype(np.float32), header=hdr, clobber=True)
         debug('Wrote', ofn)
 
+    timing_stop('PHASE_write_planes')
     ofn = prefix + '-frames.fits'
 
     WISE.writeto(ofn)
@@ -3827,7 +3834,8 @@ def main():
         if opt.pdf:
             ps.suffixes = ['png','pdf']
 
-    WISE = get_wise_frames(tile.ra, tile.dec, opt.band)
+    with timing_stage('PHASE_metadata'):
+        WISE = get_wise_frames(tile.ra, tile.dec, opt.band)
 
     if not os.path.exists(opt.outdir) and not opt.wishlist:
         print('Creating output directory', opt.outdir)

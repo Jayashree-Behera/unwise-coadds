@@ -78,6 +78,27 @@ def stage(name):
     return _Stage(name)
 
 
+_OPEN = {}
+
+
+def start(name):
+    """Open an interval under `name`; close it with stop(name)."""
+    if not ENABLED:
+        return
+    _OPEN[name] = time.time()
+
+
+def stop(name):
+    """Close the interval opened by start(name) and accumulate it."""
+    if not ENABLED:
+        return
+    t0 = _OPEN.pop(name, None)
+    if t0 is None:
+        return
+    _TIME[name] = _TIME.get(name, 0.0) + (time.time() - t0)
+    _N[name] = _N.get(name, 0) + 1
+
+
 def report(label='pipeline'):
     """One-line summary of this process's accumulated stage times."""
     if not _TIME:
