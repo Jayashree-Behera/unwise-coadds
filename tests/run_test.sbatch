@@ -14,6 +14,7 @@
 #
 #   sbatch --export=ALL,TAG=baseline,CODEPATH=...,THREAD_ARGS="--threads1 16" run_test.sbatch
 #
+# TILE        tile id to coadd
 # TAG         leaf directory name for this variant's outputs
 # CODEPATH    which checkout to run
 # THREAD_ARGS thread flags to pass through
@@ -21,7 +22,7 @@
 
 set -euo pipefail
 
-TILES="1869p121"
+TILES="${TILE:-1869p121}"
 BANDS="1 2"
 FORCE=1
 FORCE_BG=0
