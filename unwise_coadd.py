@@ -78,6 +78,20 @@ destripe_force = False # should get assigned in main
 # multiprocessing pools are created.
 want_output_masks = True # should get assigned in main
 
+# --threads: number of worker processes for round 2. Unlike round 1's pool,
+# this one is forked lazily inside coadd_wise once round 1 has produced the
+# shared coadd arrays below, so the workers inherit them copy-on-write.
+round2_threads = None # should get assigned in main
+
+# Round-1 coadd planes, published here by coadd_wise immediately before the
+# round-2 pool is forked. Every round-2 task needs all four, and they are
+# 2048x2048 float64 (134 MB for the set), so passing them through the pool's
+# argument pickling instead would dominate the run.
+_r2_cow1 = None
+_r2_cowimg1 = None
+_r2_cowimgsq1 = None
+_r2_con1 = None
+
 class FirstRoundCoadd():
     def __init__(self, coimg1, cow1, coppstd1, cowimgsq1, con1):
         self.coimg1 = coimg1
@@ -1670,6 +1684,25 @@ def _bounce_one_round2(*A):
         traceback.print_exc()
         raise
 
+def _bounce_one_round2_shared(X):
+    '''
+    Round-2 worker entry point for the parallel path.
+
+    The four round-1 coadd planes are picked up from module globals that the
+    worker inherited across the fork, rather than being pickled into every
+    task; only this exposure's own `rr` travels through the pool.
+    '''
+    (ri, N, scanid, rr, tinyw, plotfn, ps1, do_dsky, rchi_fraction) = X
+    try:
+        return _coadd_one_round2(
+            (ri, N, scanid, rr, _r2_cow1, _r2_cowimg1, _r2_cowimgsq1, tinyw,
+             plotfn, ps1, do_dsky, rchi_fraction, _r2_con1))
+    except:
+        import traceback
+        print('_coadd_one_round2 failed:')
+        traceback.print_exc()
+        raise
+
 def _coadd_one_round2(X):
     '''
     For multiprocessing, the function to be called for each round-2
@@ -2408,7 +2441,9 @@ def coadd_wise(tile, cowcs, WISE, ps, band, mp1, mp2,
     debug('After garbage collection:', Time()-t0)
     ps1 = (ps is not None)
     delmm = (ps is None)
-    if not mp2.pool:
+    # round2_threads, not mp2.pool: the round-2 pool is forked below, once the
+    # round-1 planes exist, so there is nothing to look at on mp2 yet.
+    if not round2_threads or round2_threads <= 1:
         coadd = coaddacc(H, W, do_cube=do_cube, nims=len(rimgs), minmax=minmax)
         masks = []
         ri = -1
@@ -2438,41 +2473,121 @@ def coadd_wise(tile, cowcs, WISE, ps, band, mp1, mp2,
                 mm.frame_num = this_frame_num
             masks.append(mm)
     else:
-        # this will be screwed up if warp_all is True ...
-        args = []
-        N = len(WISE)
-        for ri,rr in enumerate(rimgs):
-            if ps and plots2:
-                plotfn = ps.getnext()
-            else:
-                plotfn = None
-            scanid = ('scan %s frame %i band %i' %
-                      (WISE.scan_id[ri], WISE.frame_num[ri], band))
-            args.append((ri, N, scanid, rr, r1_coadd.cow1, r1_coadd.cowimg1, r1_coadd.cowimgsq1, tinyw,
-                         plotfn, ps1, do_dsky, rchi_fraction, r1_coadd.con1))
-        masks = mp2.map(_bounce_one_round2, args)
-        del args
-        info('Accumulating second-round coadds...')
-        coadd = coaddacc(H, W, do_cube=do_cube, nims=Nimgs, bgmatch=bgmatch,
-                         minmax=minmax)
+        # Round 2 in parallel.
+        #
+        # The previous version of this branch built one argument tuple per
+        # exposure, each carrying cow1/cowimg1/cowimgsq1/con1 -- four full
+        # 2048^2 float64 planes, 134 MB per task -- and handed the whole list
+        # to Pool.map, which pickles every task. It then threw the result away
+        # and read results back from `maskiter`, a name that does not exist
+        # anywhere in this file, so the branch could never have completed.
+        #
+        # Here the four planes are published as module globals and the pool is
+        # forked at this point, after round 1, so the workers inherit them
+        # copy-on-write and a task carries only its own `rr`.
+        #
+        # Pool.imap yields results in submission order, so coadd.acc() is
+        # called in exactly the sequence the serial branch uses and the
+        # float64 accumulation is bit-identical.
+        #
+        # Tasks are produced lazily and throttled with a semaphore so the
+        # number in flight stays bounded and `rimgs` entries are released as
+        # the run progresses, rather than the whole input being queued up
+        # front. That matters for deep fields with very many exposures.
+        import threading
+        import multiprocessing
+
+        global _r2_cow1, _r2_cowimg1, _r2_cowimgsq1, _r2_con1
+        _r2_cow1      = r1_coadd.cow1
+        _r2_cowimg1   = r1_coadd.cowimg1
+        _r2_cowimgsq1 = r1_coadd.cowimgsq1
+        _r2_con1      = r1_coadd.con1
+
+        num_round1_images = len(rimgs)
+        coadd = coaddacc(H, W, do_cube=do_cube, nims=num_round1_images,
+                         bgmatch=bgmatch, minmax=minmax)
+        masks = []
+
+        # Identify each exposure exactly as the serial branch does.
+        if warp_all:
+            ids = [(rr.scan_id, rr.frame_num) for rr in rimgs]
+        else:
+            ids = [(WISE.scan_id[ri], WISE.frame_num[ri])
+                   for ri in range(num_round1_images)]
+
+        inflight = threading.Semaphore(2 * round2_threads)
+        aborted = []
+
+        def _round2_tasks():
+            for ri in range(num_round1_images):
+                # Bounded acquire, so that if the consumer below dies the
+                # generator can notice and stop instead of parking forever in
+                # Pool's task handler thread and hanging pool.join().
+                while not inflight.acquire(timeout=1.0):
+                    if aborted:
+                        return
+                if aborted:
+                    return
+                rr = rimgs[ri]
+                # Drop the parent's reference now; the worker gets its own
+                # copy, and holding the whole list to the end of round 2 is
+                # what the serial branch's rimgs.pop(0) exists to avoid.
+                rimgs[ri] = None
+                if ps and plots2:
+                    plotfn = ps.getnext()
+                else:
+                    plotfn = None
+                scanid = ('scan %s frame %i band %i' %
+                          (ids[ri][0], ids[ri][1], band))
+                yield (ri, num_round1_images, scanid, rr, tinyw,
+                       plotfn, ps1, do_dsky, rchi_fraction)
+
+        # fork (not spawn/forkserver) is required: the whole point is that the
+        # workers see the round-1 planes without them being pickled.
+        ctx = multiprocessing.get_context('fork')
+        gc.collect()
+        if hasattr(gc, 'freeze'):
+            # Keep the children's collector from walking -- and therefore
+            # writing to, and un-sharing -- the large object graph round 1
+            # just built.
+            gc.freeze()
+        pool = ctx.Pool(round2_threads)
+        if hasattr(gc, 'unfreeze'):
+            gc.unfreeze()
+
+        info('Round 2 running on %i processes' % round2_threads)
         t0 = Time()
         inext = 16
-        i = 0
-        masks = []
-        while True:
-            try:
-                mm = next(maskiter)
-            except StopIteration:
-                break
-            i += 1
-            masks.append(mm)
-            if mm is None:
-                continue
-            with timing_stage('round2_acc'):
-                coadd.acc(mm, delmm=delmm)
-            if i == inext:
-                inext *= 2
-                info('Accumulated', i, 'of', Nimgs, ':', Time()-t0)
+        nacc = 0
+        try:
+            results = pool.imap(_bounce_one_round2_shared, _round2_tasks(),
+                                chunksize=1)
+            for i, mm in enumerate(results):
+                inflight.release()
+                with timing_stage('round2_acc'):
+                    coadd.acc(mm, delmm=delmm)
+                if mm is not None:
+                    mm.scan_id, mm.frame_num = ids[i]
+                masks.append(mm)
+                nacc = i + 1
+                if nacc == inext:
+                    inext *= 2
+                    info('Accumulated', nacc, 'of', num_round1_images, ':',
+                         Time() - t0)
+        except BaseException:
+            aborted.append(True)
+            inflight.release()
+            pool.terminate()
+            pool.join()
+            raise
+        else:
+            pool.close()
+            pool.join()
+        if nacc != num_round1_images:
+            raise RuntimeError(
+                'round 2 produced %i results for %i exposures'
+                % (nacc, num_round1_images))
+        del rimgs[:]
 
     timing_report_now('round2')
     t0 = Time()
@@ -3355,14 +3470,20 @@ def main():
     if (opt.destripe_cache or opt.force_bg) and destripe_save_dir is None:
         parser.error('--destripe-cache / --force-bg require --save-corrected-images')
 
-    if opt.threads:
-        mp2 = multiproc(opt.threads)
-    else:
-        mp2 = multiproc()
-    if opt.threads1 is None:
-        mp1 = mp2
-    else:
+    # Round 2's pool is forked inside coadd_wise, after round 1 has built the
+    # coadd planes the workers need, so that they are inherited copy-on-write
+    # rather than pickled into every task. Only the thread count is recorded
+    # here; mp2 stays a serial stub.
+    global round2_threads
+    round2_threads = opt.threads
+
+    if opt.threads1 is not None:
         mp1 = multiproc(opt.threads1)
+    elif opt.threads:
+        mp1 = multiproc(opt.threads)
+    else:
+        mp1 = multiproc()
+    mp2 = multiproc()
 
     arr = os.environ.get('PBS_ARRAYID')
     if arr is not None:
