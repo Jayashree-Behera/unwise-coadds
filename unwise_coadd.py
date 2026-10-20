@@ -92,6 +92,19 @@ _r2_cowimg1 = None
 _r2_cowimgsq1 = None
 _r2_con1 = None
 
+# Worker count for the warp-recovery pass in process_round1_quadrants, which
+# re-runs the whole of round 1 (three FITS reads, destripe, patch, sky fit,
+# resample) once per exposure. Set in main() from --threads1/--threads.
+recover_threads = None # should get assigned in main
+
+# Read-only context shared with the recovery workers, published immediately
+# before that pool is forked for the same copy-on-write reason as above:
+# `reference` carries full-size coadd planes.
+_rq_cowcs = None
+_rq_reference = None
+_rq_zp_lookup_obj = None
+_rq_kwargs = None
+
 class FirstRoundCoadd():
     def __init__(self, coimg1, cow1, coppstd1, cowimgsq1, con1):
         self.coimg1 = coimg1
@@ -635,6 +648,112 @@ def split_one_quadrant(rimg, wise, quad_num, redo_sky=False, reference=None, del
 
     return rimg_quad
 
+class _PoolGate(object):
+    '''
+    Back-pressure for a lazily-generated stream of pool tasks.
+
+    Pool's task handler thread drains the input iterable as fast as it can,
+    so without a gate the entire input is queued -- and pickled -- up front.
+    The bounded acquire is what lets the generator notice that the consumer
+    has died; a plain acquire() would park the handler thread forever and
+    hang pool.join().
+    '''
+    def __init__(self, n):
+        import threading
+        self._sem = threading.Semaphore(n)
+        self._aborted = False
+
+    def acquire(self):
+        while not self._sem.acquire(timeout=1.0):
+            if self._aborted:
+                return False
+        return not self._aborted
+
+    def release(self):
+        self._sem.release()
+
+    def abort(self):
+        self._aborted = True
+        self._sem.release()
+
+def _ordered_pool_imap(func, make_tasks, nthreads):
+    '''
+    Map `func` over the tasks from `make_tasks(gate)` and yield the results
+    in submission order, so that order-dependent accumulation in the caller
+    stays bit-identical to running serially.
+
+    fork (not spawn or forkserver) is required: callers publish large
+    read-only arrays as module globals immediately beforehand and rely on
+    the workers inheriting them copy-on-write rather than through pickling.
+    Recent Pythons no longer default to fork on Linux, hence the explicit
+    context.
+    '''
+    import multiprocessing
+    gate = _PoolGate(2 * nthreads)
+    ctx = multiprocessing.get_context('fork')
+    gc.collect()
+    # Stop the children's collector from walking -- and therefore writing to,
+    # and un-sharing -- the large object graph the parent has already built.
+    if hasattr(gc, 'freeze'):
+        gc.freeze()
+    try:
+        pool = ctx.Pool(nthreads)
+    finally:
+        if hasattr(gc, 'unfreeze'):
+            gc.unfreeze()
+    try:
+        for r in pool.imap(func, make_tasks(gate), chunksize=1):
+            gate.release()
+            yield r
+    except BaseException:
+        gate.abort()
+        pool.terminate()
+        pool.join()
+        raise
+    else:
+        pool.close()
+        pool.join()
+
+def _bounce_round1_quadrants(X):
+    '''
+    One exposure's worth of process_round1_quadrants: the full round-1
+    pipeline followed by the split into quadrants. Everything the two calls
+    need beyond the exposure itself is read-only and inherited through the
+    fork, so only the metadata row travels through the pool.
+    '''
+    wi, N, wise = X
+    kw = _rq_kwargs
+    rr = _coadd_one_round1((wi, N, wise, kw['table'], kw['L'], None, kw['band'],
+                            _rq_cowcs, kw['medfilt'], kw['do_check_md5'],
+                            _rq_zp_lookup_obj), store_xy_coords=True)
+    quads = split_one_l1b_round1(rr, wise, reference=_rq_reference,
+                                 delete_xy_coords=kw['delete_xy_coords'],
+                                 do_apply_warp=kw['do_apply_warp'],
+                                 save_raw=kw['save_raw'],
+                                 only_good_chi2=kw['only_good_chi2'],
+                                 debug=kw['debug'], do_rebin=kw['do_rebin'])
+    return (quads, wise.scan_id, wise.frame_num)
+
+def _bounce_round1_quadrants_serial(wi, N, wise, cowcs, reference,
+                                    zp_lookup_obj, kw):
+    '''
+    In-process equivalent of _bounce_round1_quadrants, used when recovery is
+    not threaded. Kept separate so the serial path does not depend on the
+    module globals the pool workers inherit.
+    '''
+    rr = _coadd_one_round1((wi, N, wise, kw['table'], kw['L'], None, kw['band'],
+                            cowcs, kw['medfilt'], kw['do_check_md5'],
+                            zp_lookup_obj), store_xy_coords=True)
+    # Deliberately not accumulated into a list: these hold the x_l1b/y_l1b/
+    # x_coadd/y_coadd coordinate lists and would need a lot of RAM.
+    quads = split_one_l1b_round1(rr, wise, reference=reference,
+                                 delete_xy_coords=kw['delete_xy_coords'],
+                                 do_apply_warp=kw['do_apply_warp'],
+                                 save_raw=kw['save_raw'],
+                                 only_good_chi2=kw['only_good_chi2'],
+                                 debug=kw['debug'], do_rebin=kw['do_rebin'])
+    return (quads, wise.scan_id, wise.frame_num)
+
 def process_round1_quadrants(WISE, cowcs, zp_lookup_obj, r1_coadd=None, delete_xy_coords=False, reference=None,
                              do_apply_warp=False, save_raw=False, coadd=None, only_good_chi2=True, debug=False,
                              do_rebin=False):
@@ -662,16 +781,47 @@ def process_round1_quadrants(WISE, cowcs, zp_lookup_obj, r1_coadd=None, delete_x
     n_attempted = 0
     n_skipped = 0
     print("Creating per-quadrant FirstRoundImage objects")
-    for wi, wise in enumerate(WISE):
-        # do the usual call to _coadd_one_round1 to get a typical FirstRoundImage
-        rr = _coadd_one_round1((wi, N, wise, table, L, ps, band, cowcs, medfilt,
-                                do_check_md5, zp_lookup_obj), store_xy_coords=True)
-        # do *not* want to make an intermediate list of the rr objects, since these
-        # are holding x_l1b, y_l1b, x_coadd, y_coadd coordinate lists, so this would
-        # require a lot of RAM
-        quadrants_this_exp = split_one_l1b_round1(rr, wise, reference=reference, delete_xy_coords=delete_xy_coords,
-                                                  do_apply_warp=do_apply_warp, save_raw=save_raw, 
-                                                  only_good_chi2=only_good_chi2, debug=debug, do_rebin=do_rebin)
+
+    # Each iteration below re-runs the whole of round 1 for one exposure --
+    # three FITS reads, destripe, patch, sky fit, resample -- which is the
+    # same work round 1 itself hands to a worker pool. Running it serially
+    # here made warp recovery one of the most expensive phases of the run.
+    #
+    # The per-exposure part is independent across exposures, so it is farmed
+    # out; coadd.acc() and the warp_list/r2_masks appends stay in the parent,
+    # in submission order, which is what keeps the result bit-identical.
+    exp_kwargs = dict(table=table, L=L, band=band, medfilt=medfilt,
+                      do_check_md5=do_check_md5,
+                      delete_xy_coords=delete_xy_coords,
+                      do_apply_warp=do_apply_warp, save_raw=save_raw,
+                      only_good_chi2=only_good_chi2, debug=debug,
+                      do_rebin=do_rebin)
+
+    if recover_threads and recover_threads > 1 and N > 1:
+        global _rq_cowcs, _rq_reference, _rq_zp_lookup_obj, _rq_kwargs
+        _rq_cowcs = cowcs
+        _rq_reference = reference
+        _rq_zp_lookup_obj = zp_lookup_obj
+        _rq_kwargs = exp_kwargs
+
+        def _quad_tasks(gate):
+            for wi, wise in enumerate(WISE):
+                if not gate.acquire():
+                    return
+                yield (wi, N, wise)
+
+        print('Per-quadrant round 1 running on %i processes' % recover_threads)
+        exp_results = _ordered_pool_imap(_bounce_round1_quadrants, _quad_tasks,
+                                         recover_threads)
+    else:
+        def _quad_serial():
+            for wi, wise in enumerate(WISE):
+                yield _bounce_round1_quadrants_serial(wi, N, wise, cowcs,
+                                                      reference, zp_lookup_obj,
+                                                      exp_kwargs)
+        exp_results = _quad_serial()
+
+    for wi, (quadrants_this_exp, exp_scan_id, exp_frame_num) in enumerate(exp_results):
         if coadd is None:
             if quadrants_this_exp is not None:
                 quad_rimgs.extend(quadrants_this_exp)
@@ -680,7 +830,7 @@ def process_round1_quadrants(WISE, cowcs, zp_lookup_obj, r1_coadd=None, delete_x
                 for qq in quadrants_this_exp:
                     if qq.warped:
                         if r1_coadd is not None:
-                            scanid = ('scan %s frame %i band %i' % (wise.scan_id, wise.frame_num, band))
+                            scanid = ('scan %s frame %i band %i' % (exp_scan_id, exp_frame_num, band))
                             plotfn = None
                             ps1 = False # maybe this should be None instead ?
                             do_dsky = False
@@ -693,8 +843,8 @@ def process_round1_quadrants(WISE, cowcs, zp_lookup_obj, r1_coadd=None, delete_x
                                 n_skipped += 1
                                 continue
                             coadd.acc(mm, delmm=delmm)
-                            mm.scan_id = wise.scan_id
-                            mm.frame_num = wise.frame_num
+                            mm.scan_id = exp_scan_id
+                            mm.frame_num = exp_frame_num
                             r2_masks.append(mm)
                         warp_list.append(qq.warp)
                         n_succeeded += 1
@@ -707,7 +857,6 @@ def process_round1_quadrants(WISE, cowcs, zp_lookup_obj, r1_coadd=None, delete_x
                         n_attempted += 1
                         print('Quadrant recovery failed.')
         del quadrants_this_exp
-        del rr
 
     if coadd is None:
         # get n_attempted, n_succeeded, n_skipped right ... should really clean this up at some point
@@ -2494,9 +2643,6 @@ def coadd_wise(tile, cowcs, WISE, ps, band, mp1, mp2,
         # number in flight stays bounded and `rimgs` entries are released as
         # the run progresses, rather than the whole input being queued up
         # front. That matters for deep fields with very many exposures.
-        import threading
-        import multiprocessing
-
         global _r2_cow1, _r2_cowimg1, _r2_cowimgsq1, _r2_con1
         _r2_cow1      = r1_coadd.cow1
         _r2_cowimg1   = r1_coadd.cowimg1
@@ -2515,18 +2661,9 @@ def coadd_wise(tile, cowcs, WISE, ps, band, mp1, mp2,
             ids = [(WISE.scan_id[ri], WISE.frame_num[ri])
                    for ri in range(num_round1_images)]
 
-        inflight = threading.Semaphore(2 * round2_threads)
-        aborted = []
-
-        def _round2_tasks():
+        def _round2_tasks(gate):
             for ri in range(num_round1_images):
-                # Bounded acquire, so that if the consumer below dies the
-                # generator can notice and stop instead of parking forever in
-                # Pool's task handler thread and hanging pool.join().
-                while not inflight.acquire(timeout=1.0):
-                    if aborted:
-                        return
-                if aborted:
+                if not gate.acquire():
                     return
                 rr = rimgs[ri]
                 # Drop the parent's reference now; the worker gets its own
@@ -2542,47 +2679,23 @@ def coadd_wise(tile, cowcs, WISE, ps, band, mp1, mp2,
                 yield (ri, num_round1_images, scanid, rr, tinyw,
                        plotfn, ps1, do_dsky, rchi_fraction)
 
-        # fork (not spawn/forkserver) is required: the whole point is that the
-        # workers see the round-1 planes without them being pickled.
-        ctx = multiprocessing.get_context('fork')
-        gc.collect()
-        if hasattr(gc, 'freeze'):
-            # Keep the children's collector from walking -- and therefore
-            # writing to, and un-sharing -- the large object graph round 1
-            # just built.
-            gc.freeze()
-        pool = ctx.Pool(round2_threads)
-        if hasattr(gc, 'unfreeze'):
-            gc.unfreeze()
-
         info('Round 2 running on %i processes' % round2_threads)
         t0 = Time()
         inext = 16
         nacc = 0
-        try:
-            results = pool.imap(_bounce_one_round2_shared, _round2_tasks(),
-                                chunksize=1)
-            for i, mm in enumerate(results):
-                inflight.release()
-                with timing_stage('round2_acc'):
-                    coadd.acc(mm, delmm=delmm)
-                if mm is not None:
-                    mm.scan_id, mm.frame_num = ids[i]
-                masks.append(mm)
-                nacc = i + 1
-                if nacc == inext:
-                    inext *= 2
-                    info('Accumulated', nacc, 'of', num_round1_images, ':',
-                         Time() - t0)
-        except BaseException:
-            aborted.append(True)
-            inflight.release()
-            pool.terminate()
-            pool.join()
-            raise
-        else:
-            pool.close()
-            pool.join()
+        results = _ordered_pool_imap(_bounce_one_round2_shared, _round2_tasks,
+                                     round2_threads)
+        for i, mm in enumerate(results):
+            with timing_stage('round2_acc'):
+                coadd.acc(mm, delmm=delmm)
+            if mm is not None:
+                mm.scan_id, mm.frame_num = ids[i]
+            masks.append(mm)
+            nacc = i + 1
+            if nacc == inext:
+                inext *= 2
+                info('Accumulated', nacc, 'of', num_round1_images, ':',
+                     Time() - t0)
         if nacc != num_round1_images:
             raise RuntimeError(
                 'round 2 produced %i results for %i exposures'
@@ -3484,6 +3597,11 @@ def main():
     else:
         mp1 = multiproc()
     mp2 = multiproc()
+
+    # Warp recovery re-runs round 1 one exposure at a time, so it wants the
+    # round-1 worker count, falling back to --threads.
+    global recover_threads
+    recover_threads = opt.threads1 if opt.threads1 is not None else opt.threads
 
     arr = os.environ.get('PBS_ARRAYID')
     if arr is not None:
