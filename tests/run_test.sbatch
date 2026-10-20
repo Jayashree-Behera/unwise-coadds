@@ -19,6 +19,12 @@
 # CODEPATH    which checkout to run
 # THREAD_ARGS thread flags to pass through
 # TIMING      value for UNWISE_TIMING (0 = off; baseline has no such support)
+# MODE        plain | destripe | both  (default plain)
+#
+# The default is plain because the destripe run with a fresh EXP_OUTPATH has
+# no cached corrected exposures to reuse and would recompute every background
+# model. The plain path already exercises everything that was changed: round 1,
+# warp recovery, HiLo, round 2 and patch_image.
 
 set -euo pipefail
 
@@ -28,6 +34,7 @@ FORCE=1
 FORCE_BG=0
 THREAD_ARGS="${THREAD_ARGS:---threads1 16}"
 TIMING="${TIMING:-0}"
+MODE="${MODE:-plain}"
 TAG="${TAG:?set TAG}"
 CODEPATH="${CODEPATH:?set CODEPATH}"
 
@@ -72,6 +79,7 @@ date
 export DESTRIPE_TIMING=50
 export UNWISE_TIMING="$TIMING"
 
+if [[ "$MODE" == "destripe" || "$MODE" == "both" ]]; then
 echo "=== DESTRIPE RUN"
 python -u "$CODEPATH/unwise_coadd.py" \
     --tile "$TILE" --band "$BAND" \
@@ -83,12 +91,15 @@ python -u "$CODEPATH/unwise_coadd.py" \
     --save-corrected-images "$EXP_OUTPATH" \
     $THREAD_ARGS \
     --recover_warped --hi_lo_rej --no_output_masks $EXTRA $DESTRIPE_EXTRA
+fi
 
+if [[ "$MODE" == "plain" || "$MODE" == "both" ]]; then
 echo "=== PLAIN RUN"
 python -u "$CODEPATH/unwise_coadd.py" \
     --tile "$TILE" --band "$BAND" \
     --outdir "$PLAIN_OUTPATH" \
     $THREAD_ARGS \
     --recover_warped --hi_lo_rej --no_output_masks $EXTRA
+fi
 date
 echo "=== DONE TAG=$TAG band=$BAND"
