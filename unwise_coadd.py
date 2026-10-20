@@ -95,7 +95,11 @@ _r2_con1 = None
 # Worker count for the warp-recovery pass in process_round1_quadrants, which
 # re-runs the whole of round 1 (three FITS reads, destripe, patch, sky fit,
 # resample) once per exposure. Set in main() from --threads1/--threads.
-recover_threads = None # should get assigned in main
+recover_threads = None # assigned per tile in one_coadd
+
+# Raw --threads1/--threads values, which may be the string 'auto'.
+requested_threads1 = 'auto'
+requested_threads2 = 'auto'
 
 # Read-only context shared with the recovery workers, published immediately
 # before that pool is forked for the same copy-on-write reason as above:
@@ -647,6 +651,129 @@ def split_one_quadrant(rimg, wise, quad_num, redo_sky=False, reference=None, del
         rimg_quad.clear_xy_coords()
 
     return rimg_quad
+
+def threads_arg(v):
+    '''argparse type for --threads/--threads1: an integer, or "auto".'''
+    if v is None:
+        return None
+    if str(v).strip().lower() == 'auto':
+        return 'auto'
+    return int(v)
+
+def available_cpus():
+    '''
+    Cores this process may actually use.
+
+    sched_getaffinity reflects the CPU mask the batch system applied, so a
+    job packing several tiles onto one node with srun -c N sees N here and
+    sizes its pools accordingly, with no extra configuration.
+    '''
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+def available_memory_bytes():
+    '''
+    Memory this process may actually use, preferring the cgroup limit the
+    batch system imposed over the machine's total.
+    '''
+    vals = []
+    for path, parse in (
+            ('/sys/fs/cgroup/memory.max', lambda t: None if t.strip() == 'max' else int(t)),
+            ('/sys/fs/cgroup/memory/memory.limit_in_bytes', int)):
+        try:
+            with open(path) as f:
+                v = parse(f.read())
+            # cgroup v1 reports an absurd sentinel when unlimited.
+            if v and v < (1 << 62):
+                vals.append(v)
+        except (IOError, OSError, ValueError):
+            pass
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    vals.append(int(line.split()[1]) * 1024)
+                    break
+    except (IOError, OSError, ValueError, IndexError):
+        pass
+    if not vals:
+        return None
+    return min(vals)
+
+# Per-exposure cost of the FirstRoundImage list that round 1 builds and holds
+# until round 2 consumes it: 24.9 GB VmPeak over 3240 exposures on a measured
+# 2048x2048 tile. This is the term that decides whether a field fits at all,
+# and it does not depend on the worker count.
+RIMG_MB_PER_EXPOSURE = 7.7
+# A round-1 worker holds the int/unc/msk frames plus working copies.
+ROUND1_WORKER_MB = 110.
+# coimg/coimgsq/cow/con for rounds 1 and 2, 2048^2 float64.
+COADD_PLANES_MB = 280.
+# Headroom for the interpreter, fitsio buffers and output assembly.
+MEMORY_RESERVE_MB = 8192.
+
+def choose_threads(nframes, want1, want2):
+    '''
+    Resolve "auto" worker counts for a coadd of `nframes` exposures.
+
+    Threads are limited by cores, by the number of exposures, and by the
+    memory left after reserving for the round-1 image list -- which is the
+    binding constraint on deep fields, and is why a fixed frame-count
+    threshold is the wrong knob: what matters is how much memory this
+    particular job was actually given.
+
+    Returns (threads1, threads2). Explicit integers are passed through
+    untouched so existing invocations are unaffected.
+    '''
+    ncpu = available_cpus()
+    auto1 = (want1 == 'auto' or want1 is None)
+    auto2 = (want2 == 'auto' or want2 is None)
+    if not (auto1 or auto2):
+        return want1, want2
+
+    mem = available_memory_bytes()
+    rimg_mb = nframes * RIMG_MB_PER_EXPOSURE
+    if mem is None:
+        # Unknown budget (e.g. macOS): fall back to cores alone.
+        budget_mb = None
+        n_mem = ncpu
+    else:
+        mem_mb = mem / (1024. * 1024.)
+        budget_mb = mem_mb - MEMORY_RESERVE_MB - COADD_PLANES_MB - rimg_mb
+        n_mem = int(budget_mb // ROUND1_WORKER_MB)
+        if budget_mb <= 0:
+            fits = int((mem_mb - MEMORY_RESERVE_MB - COADD_PLANES_MB)
+                       // RIMG_MB_PER_EXPOSURE)
+            print('WARNING: %i exposures need ~%.0f GB for the round-1 image '
+                  'list but only ~%.0f GB is available; about %i exposures '
+                  'fit. Expect this coadd to run out of memory.'
+                  % (nframes, rimg_mb / 1024., mem_mb / 1024., max(0, fits)))
+
+    # Floor the memory-derived limit: workers cost ~110 MB each, so even 128
+    # of them are a rounding error against the round-1 image list. When that
+    # list is what does not fit, throttling workers cannot rescue the run and
+    # only makes it crawl, so keep a usable number and let the warning above
+    # carry the real problem.
+    n_mem = max(n_mem, min(ncpu, 16))
+    n1 = max(1, min(ncpu, max(1, nframes), n_mem))
+    # Round 2 ships ~10 MB back per exposure and must accumulate in the
+    # parent in order, so it stops scaling well past a handful of workers.
+    n2 = max(1, min(n1, 16))
+
+    print('Thread sizing: %i cores available, %i exposures, %s memory; '
+          'round 1 -> %i, round 2 -> %i'
+          % (ncpu, nframes,
+             ('%.0f GB' % (mem / (1024.**3))) if mem else 'unknown',
+             n1, n2))
+    if budget_mb is not None:
+        print('  round-1 image list ~%.0f GB, leaving ~%.0f GB for workers '
+              '(~%.0f MB each)'
+              % (rimg_mb / 1024., max(0., budget_mb) / 1024.,
+                 ROUND1_WORKER_MB))
+
+    return (n1 if auto1 else want1), (n2 if auto2 else want2)
 
 class _PoolGate(object):
     '''
@@ -1411,6 +1538,18 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     if recover_warped:
         if np.sum(WISE.use & (WISE.moon_rej | (WISE.nearby_planets != 0))) != 0:
             recover = WISE[WISE.use & (WISE.moon_rej | (WISE.nearby_planets != 0))]
+
+    # Size the worker pools now: this is the first point at which the number
+    # of exposures actually going into the coadd is known, and that -- with
+    # the cores and memory this job was given -- is what the pools should be
+    # sized from.
+    global round2_threads, recover_threads
+    nframes = int(np.sum(WISE.use & ~(WISE.moon_rej | (WISE.nearby_planets != 0))))
+    nthreads1, round2_threads = choose_threads(nframes, requested_threads1,
+                                               requested_threads2)
+    recover_threads = nthreads1
+    if nthreads1 and nthreads1 > 1:
+        mp1 = multiproc(nthreads1)
 
     # Now that we've got some information about the input frames, call
     # the real coadding code.  Maybe we should move this first loop into
@@ -3381,10 +3520,13 @@ def main():
 
     parser = argparse.ArgumentParser('%prog [options]')
 
-    parser.add_argument('--threads', dest='threads', type=int, help='Multiproc',
-                      default=None)
-    parser.add_argument('--threads1', dest='threads1', type=int, default=None,
-                      help='Multithreading during round 1')           
+    parser.add_argument('--threads', dest='threads', type=threads_arg,
+                      default='auto',
+                      help='Worker processes for round 2, or "auto"')
+    parser.add_argument('--threads1', dest='threads1', type=threads_arg,
+                      default='auto',
+                      help='Worker processes for round 1 and warp recovery, '
+                           'or "auto" to size from available cores and memory')
     parser.add_argument('-w', dest='wishlist', action='store_true',
                       default=False, help='Print needed frames and exit?')
     parser.add_argument('--plots', dest='plots', action='store_true',
@@ -3587,21 +3729,14 @@ def main():
     # coadd planes the workers need, so that they are inherited copy-on-write
     # rather than pickled into every task. Only the thread count is recorded
     # here; mp2 stays a serial stub.
-    global round2_threads
-    round2_threads = opt.threads
-
-    if opt.threads1 is not None:
-        mp1 = multiproc(opt.threads1)
-    elif opt.threads:
-        mp1 = multiproc(opt.threads)
-    else:
-        mp1 = multiproc()
+    # Worker counts are resolved per tile in one_coadd(), once the number of
+    # exposures is known; 'auto' cannot be sized before then. mp1 is rebuilt
+    # there, so this is only a placeholder for the serial case.
+    global requested_threads1, requested_threads2
+    requested_threads1 = opt.threads1 if opt.threads1 is not None else opt.threads
+    requested_threads2 = opt.threads
+    mp1 = multiproc()
     mp2 = multiproc()
-
-    # Warp recovery re-runs round 1 one exposure at a time, so it wants the
-    # round-1 worker count, falling back to --threads.
-    global recover_threads
-    recover_threads = opt.threads1 if opt.threads1 is not None else opt.threads
 
     arr = os.environ.get('PBS_ARRAYID')
     if arr is not None:
