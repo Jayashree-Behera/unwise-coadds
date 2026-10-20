@@ -660,18 +660,43 @@ def threads_arg(v):
         return 'auto'
     return int(v)
 
+def threads_per_core():
+    '''
+    Hardware threads per physical core (2 on Perlmutter's EPYC 7763, 1 if
+    SMT is off or the topology cannot be read).
+    '''
+    try:
+        with open('/sys/devices/system/cpu/cpu0/topology/thread_siblings_list') as f:
+            sibs = f.read().strip()
+    except (IOError, OSError):
+        return 1
+    n = 0
+    for part in sibs.split(','):
+        if '-' in part:
+            lo, hi = part.split('-')[:2]
+            n += int(hi) - int(lo) + 1
+        elif part:
+            n += 1
+    return max(1, n)
+
 def available_cpus():
     '''
-    Cores this process may actually use.
+    Physical cores this process may actually use.
 
     sched_getaffinity reflects the CPU mask the batch system applied, so a
     job packing several tiles onto one node with srun -c N sees N here and
     sizes its pools accordingly, with no extra configuration.
+
+    The mask counts hardware threads, which is the wrong unit here: round 1
+    is numpy work on full frames and is limited by memory bandwidth, not by
+    issue slots, so a second worker on the same core mostly adds cache
+    pressure. A Perlmutter CPU node reports 256 and should be read as 128.
     '''
     try:
-        return max(1, len(os.sched_getaffinity(0)))
+        n = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
-        return max(1, os.cpu_count() or 1)
+        n = os.cpu_count() or 1
+    return max(1, n // threads_per_core())
 
 def available_memory_bytes():
     '''
