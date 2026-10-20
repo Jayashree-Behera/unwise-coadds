@@ -323,6 +323,41 @@ def in_radec_box(ra,dec, r0,r1,d0,d1, margin):
                 (dec + margin >= d0) *
                 (dec - margin <= d1))
 
+def _prefetch(func, items, nthreads=4, ahead=4):
+    """
+    Apply `func` to `items` on a few threads, yielding results in the
+    original order.
+
+    This is for I/O-bound work only: it exists so that reads whose results
+    are consumed strictly in order can overlap their waiting. The semaphore
+    bounds how far the reader may run ahead of the consumer, so peak memory
+    stays proportional to `ahead` rather than to len(items).
+    """
+    items = list(items)
+    if len(items) < 2:
+        for it in items:
+            yield func(it)
+        return
+
+    import threading
+    from multiprocessing.pool import ThreadPool
+
+    gate = threading.Semaphore(ahead)
+
+    def feed():
+        for it in items:
+            gate.acquire()
+            yield it
+
+    pool = ThreadPool(min(nthreads, len(items)))
+    try:
+        for result in pool.imap(func, feed()):
+            gate.release()
+            yield result
+    finally:
+        pool.terminate()
+        pool.join()
+
 def get_wise_frames(racen, deccen, band, margin=1.7):
     '''
     Returns WISE frames touching the given RA,Dec box plus margin.
@@ -332,13 +367,18 @@ def get_wise_frames(racen, deccen, band, margin=1.7):
     if metadir is None:
         metadir = wisedir
     index_fname = os.path.join(metadir, 'WISE-index-L1b_w'+str(band)+'.fits')
-    WISE = fits_table(index_fname)
-    print('Read', len(WISE), 'WISE L1b frames from ' + index_fname)
-    WISE.row = np.arange(len(WISE))
-
-    # Coarse cut on RA,Dec box.
+    # The index has ~30 million rows and all but a few thousand are thrown
+    # away immediately, so read the two columns the cut needs, then read the
+    # full rows only for the survivors. WISE.row is the index into the
+    # original file, exactly as arange-then-cut produced.
     t0 = _time()
-    WISE.cut(is_nearby(WISE.ra, WISE.dec, racen, deccen, margin, fast=True))
+    coords = fits_table(index_fname, columns=['ra', 'dec'])
+    print('Read', len(coords), 'WISE L1b frames from ' + index_fname)
+    rows = np.flatnonzero(is_nearby(coords.ra, coords.dec, racen, deccen,
+                                    margin, fast=True))
+    del coords
+    WISE = fits_table(index_fname, rows=rows)
+    WISE.row = rows
     dt = _time()-t0
     print('figuring out which frames are nearby took ' + str(dt) + ' seconds')
     print('Cut to', len(WISE), 'WISE frames near RA,Dec box')
@@ -359,18 +399,22 @@ def get_wise_frames(racen, deccen, band, margin=1.7):
     # 4-band, 3-band, or 2-band phase
     WISE.phase = np.zeros(len(WISE), np.uint8)
 
-    for nbands,name in [(4,'4band'), (3,'3band'), (2,'2band'), (2,'neowiser'),
-                        (2, 'neowiser2'), (2, 'neowiser3'), (2, 'neowiser4'),
-                        (2, 'neowiser5'), (2, 'neowiser6'), (2, 'neowiser7'),
-                        (2, 'neowiser8'), (2, 'neowiser9'), (2, 'neowiser10'),
-                        (2, 'neowiser11')]:
+    # These 14 tables are ~2.5 GB in total and are read one after another,
+    # which is pure I/O wait. fitsio drops the GIL inside the read, so
+    # reading them on a few threads overlaps that wait. Each table is cut to
+    # the RA,Dec box inside the worker, so only the small cut tables are held
+    # and the raw reads stay bounded by the prefetch depth. The merge below
+    # still runs serially, in the original order, on identical data.
+    specs = []
+    for nbands, name in [(4,'4band'), (3,'3band'), (2,'2band'), (2,'neowiser'),
+                         (2, 'neowiser2'), (2, 'neowiser3'), (2, 'neowiser4'),
+                         (2, 'neowiser5'), (2, 'neowiser6'), (2, 'neowiser7'),
+                         (2, 'neowiser8'), (2, 'neowiser9'), (2, 'neowiser10'),
+                         (2, 'neowiser11')]:
         bb = [1,2,3,4][:nbands]
         if not any([b == band for b in bb]):
             # no bands of interest in this observation phase - skip
             continue
-
-        fn = os.path.join(metadir, 'WISE-l1b-metadata-%s.fits' % name)
-        print('Reading', fn)
         cols = (['ra', 'dec', 'scan_id', 'frame_num',
                  'qual_frame', 'planets', 'nearby_planets', 'moon_masked', ] +
                 ['w%iintmed16ptile' % b for b in bb] +
@@ -378,10 +422,21 @@ def get_wise_frames(racen, deccen, band, margin=1.7):
                 ['w%iintstddev' % b for b in bb])
         if nbands > 2:
             cols.append('dtanneal')
+        specs.append((nbands, name,
+                      os.path.join(metadir,
+                                   'WISE-l1b-metadata-%s.fits' % name),
+                      cols))
+
+    def _read_and_cut(spec):
+        nbands, name, fn, cols = spec
         T = fits_table(fn, columns=cols)
-        debug('Read', len(T), 'from', fn)
-        # Cut with extra large margins
+        nread = len(T)
         T.cut(is_nearby(T.ra, T.dec, racen, deccen, 2.*margin, fast=True))
+        return nbands, name, fn, nread, T
+
+    for nbands, name, fn, nread, T in _prefetch(_read_and_cut, specs):
+        print('Reading', fn)
+        debug('Read', nread, 'from', fn)
         print('Cut to', len(T), 'near RA,Dec box')
         if len(T) == 0:
             continue
