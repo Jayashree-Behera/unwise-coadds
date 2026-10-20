@@ -1202,6 +1202,8 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     if mp2 is None:
         mp2 = multiproc()
 
+    timing_start('PHASE_frameselect')
+
     wisepixscale = 2.75
 
     version = retrieve_git_version()
@@ -1582,6 +1584,8 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     recover_threads = nthreads1
     if nthreads1 and nthreads1 > 1:
         mp1 = multiproc(nthreads1)
+
+    timing_stop('PHASE_frameselect')
 
     # Now that we've got some information about the input frames, call
     # the real coadding code.  Maybe we should move this first loop into
