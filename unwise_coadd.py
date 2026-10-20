@@ -1569,8 +1569,10 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     # the cores and memory this job was given -- is what the pools should be
     # sized from.
     global round2_threads, recover_threads
-    nframes = int(np.sum(WISE.use & ~(WISE.moon_rej | (WISE.nearby_planets != 0))))
-    nthreads1, round2_threads = choose_threads(nframes, requested_threads1,
+    # NB: not `nframes`, which is the --nframes argument and is written to
+    # the output headers as UNW_FRN.
+    n_coadd_frames = int(np.sum(WISE.use & ~(WISE.moon_rej | (WISE.nearby_planets != 0))))
+    nthreads1, round2_threads = choose_threads(n_coadd_frames, requested_threads1,
                                                requested_threads2)
     recover_threads = nthreads1
     if nthreads1 and nthreads1 > 1:
