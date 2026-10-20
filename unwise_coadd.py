@@ -457,8 +457,12 @@ def get_wise_frames(racen, deccen, band, margin=1.7):
         debug('Cut to', len(I), 'matching scan/frame')
 
         K = (WISE.band[I] == band)
-        debug('Band', band, ':', sum(K))
-        if sum(K) == 0:
+        # np.count_nonzero, not the builtin sum: the builtin iterates the
+        # array one element at a time in Python, which dominated this
+        # function. The count is identical.
+        nband = np.count_nonzero(K)
+        debug('Band', band, ':', nband)
+        if nband == 0:
             continue
         II = I[K]
         JJ = J[K]
@@ -1348,50 +1352,50 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     WISE.use = np.ones(len(WISE), bool)
     WISE.moon_rej = np.zeros(len(WISE), bool)
     WISE.use *= (WISE.qual_frame > 0)
-    print('Cut out qual_frame = 0;', sum(WISE.use), 'remaining')
+    print('Cut out qual_frame = 0;', np.count_nonzero(WISE.use), 'remaining')
 
     WISE.use *= good_scan_mask(WISE)
-    print('Cut out bad scans from bad_scans.txt; ', sum(WISE.use), 'remaining')
+    print('Cut out bad scans from bad_scans.txt; ', np.count_nonzero(WISE.use), 'remaining')
 
     WISE.use *= (WISE.planets == 0)
-    print('Cut out planets != 0;', sum(WISE.use), 'remaining')
+    print('Cut out planets != 0;', np.count_nonzero(WISE.use), 'remaining')
     if not recover_warped:
         WISE.use *= (WISE.nearby_planets == 0)
-        print('Cut out nearby planets != 0;', sum(WISE.use), 'remaining')
+        print('Cut out nearby planets != 0;', np.count_nonzero(WISE.use), 'remaining')
 
     if band in [3,4]:
         WISE.use *= (WISE.dtanneal > 2000.)
-        debug('Cut out dtanneal <= 2000 seconds:', sum(WISE.use), 'remaining')
+        debug('Cut out dtanneal <= 2000 seconds:', np.count_nonzero(WISE.use), 'remaining')
 
     if band == 4:
         ok = np.array([np.logical_or(s < '03752a', s > '03761b')
                        for s in WISE.scan_id])
         WISE.use *= ok
-        debug('Cut out bad scans in W4:', sum(WISE.use), 'remaining')
+        debug('Cut out bad scans in W4:', np.count_nonzero(WISE.use), 'remaining')
 
     # Cut ones where the w?intmedian is NaN
     WISE.use *= np.isfinite(WISE.intmedian)
-    debug('Cut out intmedian non-finite:', sum(WISE.use), 'remaining')
+    debug('Cut out intmedian non-finite:', np.count_nonzero(WISE.use), 'remaining')
 
     # this will need to be adapted/modified for the time-resolved coadds...
     # Cut on moon, based on (robust) measure of standard deviation
-    if sum(WISE.moon_masked[WISE.use]):
+    if np.count_nonzero(WISE.moon_masked[WISE.use]):
         moon = WISE.moon_masked[WISE.use]
         nomoon = np.logical_not(moon)
         Imoon = np.flatnonzero(WISE.use)[moon]
-        assert(sum(moon) == len(Imoon))
-        print(sum(nomoon), 'of', sum(WISE.use), 'frames are not moon_masked')
+        assert(np.count_nonzero(moon) == len(Imoon))
+        print(np.count_nonzero(nomoon), 'of', np.count_nonzero(WISE.use), 'frames are not moon_masked')
         nomoonstdevs = WISE.intmed16p[WISE.use][nomoon]
         med = np.median(nomoonstdevs)
         mad = 1.4826 * np.median(np.abs(nomoonstdevs - med))
         print('Median', med, 'MAD', mad)
         moonstdevs = WISE.intmed16p[WISE.use][moon]
         okmoon = (moonstdevs - med)/mad < 5.
-        print(sum(np.logical_not(okmoon)), 'of', len(okmoon), 'moon-masked frames have large pixel variance')
+        print(np.count_nonzero(np.logical_not(okmoon)), 'of', len(okmoon), 'moon-masked frames have large pixel variance')
         if not recover_warped:
             WISE.use[Imoon] *= okmoon
         WISE.moon_rej[Imoon] = (~okmoon)
-        print('Cut to', sum(WISE.use), 'on moon')
+        print('Cut to', np.count_nonzero(WISE.use), 'on moon')
         del Imoon
         del moon
         del nomoon
@@ -1473,7 +1477,7 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     # directories to search for "L1b" WISE data products
     wdirs = get_l1b_dirs(yml=True, verbose=True)
     nu = 0
-    NU = sum(WISE.use)
+    NU = np.count_nonzero(WISE.use)
     failedfiles = []
     # Try to find and read the WCS headers of each WISE frame
     for wi,wise in enumerate(WISE):
@@ -1605,7 +1609,7 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
 
     # convert from object array to string array; '' rather than '0'
     WISE.intfn = np.array([{0:''}.get(s,s) for s in WISE.intfn])
-    debug('Cut to', sum(WISE.use), 'frames intersecting target')
+    debug('Cut to', np.count_nonzero(WISE.use), 'frames intersecting target')
 
     t1 = Time()
     debug('Up to coadd_wise:', t1 - t0)
