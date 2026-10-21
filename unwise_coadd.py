@@ -1408,9 +1408,11 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     if compare_moon_all:
         WISE = cut_to_epoch(WISE, epoch, before, after)
 
+    timing_start('PHASE_framelist')
     print('Frames:')
     for i,w in enumerate(WISE):
         print('  ', i, w.scan_id, '%4i' % w.frame_num, 'MJD', w.mjd)
+    timing_stop('PHASE_framelist')
    
     if frame0 or nframes or nframes_random:
         i0 = frame0
@@ -1554,6 +1556,7 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     # that path stays strictly serial.
     locate_threads = 1 if try_download else min(16, max(1, len(use_idx)))
 
+    timing_start('PHASE_locate')
     for wi, msgs, found, intfn, wcs, err in _prefetch(
             _locate_frame, use_idx, nthreads=locate_threads, ahead=4*locate_threads):
         nu += 1
@@ -1597,7 +1600,8 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
         # - WISE.imagew, WISE.imageh -- pixel size of the full image frame.
         # - WISE.coextent_q[1234] - coadd overlap region for the four quadrants
         # - WISE.imextent_q[1234] - image overlap region for the four quadrants
-        has_overlap = get_extents(wcs, cowcs, copoly, W, H, WISE, wi, ps)
+        with timing_stage('frame_extents'):
+            has_overlap = get_extents(wcs, cowcs, copoly, W, H, WISE, wi, ps)
         if not has_overlap:
             continue
 
@@ -1607,6 +1611,7 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
         e = WISE.coextent[wi,:]
         pixinrange += (1+e[1]-e[0]) * (1+e[3]-e[2])
         print('Total pixels in coadd space:', pixinrange)
+    timing_stop('PHASE_locate')
 
     # Now we can make a more informed estimate of memory use.
     if maxmem:
