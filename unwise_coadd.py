@@ -1480,93 +1480,102 @@ def one_coadd(ti, band, W, H, pixscale, WISE,
     NU = np.count_nonzero(WISE.use)
     failedfiles = []
     # Try to find and read the WCS headers of each WISE frame
-    for wi,wise in enumerate(WISE):
-        if not wise.use:
-            continue
-        nu += 1
-        debug(nu, 'of', NU, 'scan', wise.scan_id, 'frame', wise.frame_num, 'band', band)
-
-        # Search for the data products for this frame.
+    # Locating the three L1b files for a frame and reading the intensity
+    # image's WCS header costs ~28 ms of stat() plus ~31 ms of header read,
+    # all of it latency on a parallel filesystem, and it was paid once per
+    # frame in series. Sip() and os.path.exists both drop the GIL, so the
+    # lookups are overlapped on a few threads here. Everything that touches
+    # shared state -- the nu counter, the WISE columns, get_extents and
+    # pixinrange -- still happens below, serially and in frame order, and
+    # the messages each lookup would have printed are replayed in that same
+    # order, so the log is unchanged.
+    def _locate_frame(spec):
+        # Only the three immutable values this lookup needs are passed in;
+        # the worker never touches the WISE table, which the consumer below
+        # is concurrently writing to.
+        wi, scan_id, frame_num = spec
+        msgs = []
         found = False
-        # Get "phase", like "neo7" or "2band", part of the directory structure of the WISE
-        # L1b data products
-        _phase = phase_from_scanid(wise.scan_id)
-        # Search the directory for that phase, plus a "missing" directory, and then optionally
-        # download any files that are still missing.
+        intfn = None
+        wcs = None
+        _phase = phase_from_scanid(scan_id)
         for wdir in [wdirs[_phase], wdirs['missing']] + [None]:
-
-            # (we only hit this case if we didn't find the image in its expected place or the
-            # "missing" directory)
             download = False
             if wdir is None:
                 download = try_download
-                # Download into the 'missing' directory from l1b_dirs.yml rather
-                # than a cwd-relative path, so frames land in shared storage and
-                # are found by the wdirs['missing'] pass on later runs.
                 wdir = wdirs['missing']
 
-            # the intensity image filename
-            intfn = get_l1b_file(wdir, wise.scan_id, wise.frame_num, band, int_gz=int_gz)
+            intfn = get_l1b_file(wdir, scan_id, frame_num, band,
+                                 int_gz=int_gz)
 
             if download:
-                # An earlier interrupted download can leave one or two of the
-                # three files behind. That frame is unusable, but looks present
-                # enough to be skipped rather than refetched, so it would stay
-                # broken forever. Clear it before asking wget for the set.
                 nrm = clear_partial_l1b_triplet(intfn, int_gz=int_gz)
                 if nrm:
-                    print('Removed %i file(s) of an incomplete frame before '
-                          're-downloading:' % nrm, intfn)
-                download_frameset_1band(wise.scan_id, wise.frame_num, band,
+                    msgs.append(('print',
+                                 ('Removed %i file(s) of an incomplete frame '
+                                  'before re-downloading:' % nrm, intfn)))
+                download_frameset_1band(scan_id, frame_num, band,
                                         dest_dir=wdirs['missing'])
 
             if not os.path.exists(intfn):
-                debug('does not exist:', intfn)
+                msgs.append(('debug', ('does not exist:', intfn)))
                 continue
 
-            # Also make sure the uncertainty and mask images exist.
             unc_fn = intfn.replace('-int-', '-unc-') + ('.gz' if not int_gz else '')
             msk_fn = intfn.replace('-int-', '-msk-') + ('.gz' if not int_gz else '')
             if not(os.path.exists(unc_fn) and os.path.exists(msk_fn)):
-                print('missing uncertainty or mask files:', unc_fn, msk_fn)
+                msgs.append(('print', ('missing uncertainty or mask files:',
+                                       unc_fn, msk_fn)))
                 continue
 
-            print('intfn', intfn)
-            # Intensity image exists, try reading it
+            msgs.append(('print', ('intfn', intfn)))
             try:
-                # Intensity images may be gzipped - the "Sip" code (WCS header reader)
-                # can't handle gzipped inputs, so if they're gzipped, we run "gunzip"
-                # to unzip them to a temp file before reading the WCS header.
                 if not int_gz:
                     wcs = Sip(intfn)
                 else:
-                    # FIXME - should use tempfile.NamedTemporaryFile or something similar
                     tmpname = (intfn.split('/'))[-1]
                     tmpname = tmpname.replace('.gz', '')
-                    # add random stuff to tmpname to avoid collisions b/w simultaneous jobs
                     tmpname = str(random.randint(0, 1000000)).zfill(7) + '-' + tmpname
                     cmd_unzip_tmp = 'gunzip -c '+ intfn + ' > ' + tmpname
                     os.system(cmd_unzip_tmp)
                     wcs = Sip(tmpname)
-                    # delete unzipped temp file
                     cmd_delete_tmp = 'rm ' +  tmpname
                     os.system(cmd_delete_tmp)
             except RuntimeError:
-                # Some sort of I/O error reading the file
-                print('Error reading WCS header from intensity file', intfn)
-                import traceback
-                traceback.print_exc()
-                raise
+                return wi, msgs, False, intfn, None, sys.exc_info()
 
-            # If we get here, we have successfully found the intensity file and read its
-            # WCS header!  Set the "found" flag and stop searching more directories
             found = True
             break
+        return wi, msgs, found, intfn, wcs, None
+
+    use_idx = [(wi, WISE.scan_id[wi], WISE.frame_num[wi])
+               for wi in range(len(WISE)) if WISE.use[wi]]
+    # Downloading mutates a shared directory and shells out per frame, so
+    # that path stays strictly serial.
+    locate_threads = 1 if try_download else min(16, max(1, len(use_idx)))
+
+    for wi, msgs, found, intfn, wcs, err in _prefetch(
+            _locate_frame, use_idx, nthreads=locate_threads, ahead=4*locate_threads):
+        nu += 1
+        debug(nu, 'of', NU, 'scan', WISE.scan_id[wi], 'frame', WISE.frame_num[wi],
+              'band', band)
+        for kind, args in msgs:
+            if kind == 'debug':
+                debug(*args)
+            else:
+                print(*args)
+
+        if err is not None:
+            # Some sort of I/O error reading the file
+            print('Error reading WCS header from intensity file', intfn)
+            import traceback
+            traceback.print_exception(*err)
+            raise err[1]
 
         if not found:
             WISE.use[wi] = False
-            print('WARNING: Not found: scan', wise.scan_id, 'frame', wise.frame_num,
-                  'band', band)
+            print('WARNING: Not found: scan', WISE.scan_id[wi], 'frame',
+                  WISE.frame_num[wi], 'band', band)
             continue
 
         # Save the intensity filename
