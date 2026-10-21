@@ -25,7 +25,10 @@ import fitsio
 
 from astrometry.util.file import trymakedirs
 from astrometry.util.fits import fits_table, merge_tables
-from astrometry.util.miscutils import estimate_mode, polygons_intersect, clip_polygon
+from astrometry.util.miscutils import estimate_mode, clip_polygon
+from astrometry.util.miscutils import polygons_intersect as _polygons_intersect_ref
+from astrometry.util.miscutils import point_in_poly as _point_in_poly
+from astrometry.util.miscutils import line_segments_intersect as _line_segments_intersect
 # Bit-identical, ~2.5x faster replacement for
 # astrometry.util.miscutils.patch_image; see fast_patch.py.
 from fast_patch import patch_image
@@ -1093,6 +1096,46 @@ def process_round1_quadrants(WISE, cowcs, zp_lookup_obj, r1_coadd=None, delete_x
             return quad_rimgs, rstats
     else:
         return coadd, warp_list, r2_masks, rstats
+
+def polygons_intersect(poly1, poly2):
+    """
+    Vectorised stand-in for astrometry.util.miscutils.polygons_intersect.
+
+    point_in_poly is written to take arrays of x and y, but the upstream
+    caller feeds it one vertex at a time, so every test runs the whole
+    winding loop on one-element arrays. Testing all vertices in a single
+    call does the same arithmetic elementwise, with a fraction of the numpy
+    call overhead; this was half the cost of get_extents, which is itself
+    one of the larger phases of a coadd.
+
+    The result is the same: the first vertex found inside the other polygon,
+    scanning poly1 then poly2, else the first segment crossing, else False.
+    Callers only use the truth value, and a returned vertex tuple is always
+    truthy, as upstream.
+    """
+    poly1 = np.asarray(poly1)
+    poly2 = np.asarray(poly2)
+
+    inside = np.atleast_1d(_point_in_poly(poly1[:, 0], poly1[:, 1], poly2))
+    if inside.any():
+        i = int(np.argmax(inside))
+        return (poly1[i, 0], poly1[i, 1])
+
+    inside = np.atleast_1d(_point_in_poly(poly2[:, 0], poly2[:, 1], poly1))
+    if inside.any():
+        i = int(np.argmax(inside))
+        return (poly2[i, 0], poly2[i, 1])
+
+    N1 = len(poly1)
+    N2 = len(poly2)
+    for i in range(N1):
+        for j in range(N2):
+            xy = _line_segments_intersect(
+                poly1[i % N1, :], poly1[(i+1) % N1, :],
+                poly2[j % N2, :], poly2[(j+1) % N2, :])
+            if xy:
+                return xy
+    return False
 
 def get_extents_quadrant(wcs, cowcs, copoly, W, H, WISE, wi, ps, quad_num, coextent, imextent, margin=10):
     # want to calculate coextent-like and imextent-like values for an L1b 
